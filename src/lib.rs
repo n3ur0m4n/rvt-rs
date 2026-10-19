@@ -177,6 +177,7 @@ pub mod native_graphics_traversal;
 pub mod native_index;
 pub mod native_metadata;
 pub mod native_parameter_definitions;
+pub mod native_parameter_values;
 pub mod native_parameters;
 pub mod native_parametric_mesh;
 pub mod native_parametric_surface;
