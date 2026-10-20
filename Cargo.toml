@@ -199,6 +199,10 @@ name = "rvt-params"
 path = "src/bin/rvt_params.rs"
 
 [[bin]]
+name = "rvt-views"
+path = "src/bin/rvt_views.rs"
+
+[[bin]]
 name = "rvt-capabilities"
 path = "src/bin/rvt_capabilities.rs"
 

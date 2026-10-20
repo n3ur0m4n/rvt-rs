@@ -7,7 +7,7 @@
 //! carry only their negative `BuiltInParameter` id.
 
 use clap::Parser;
-use rvt::native_parameter_values::{self, Links, ParameterValue};
+use rvt::native_parameter_values::{self, ParameterValue};
 use rvt::{RevitFile, native_document};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -72,17 +72,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let mut rf = RevitFile::open(&cli.file)?;
     let mut options = native_document::Options::default();
     options.selected_ids.extend(cli.ids);
-    let mut links = Links::default();
-    let mut projected = Vec::new();
-    let summary = native_document::extract(&mut rf, &options, |record| {
-        links.ingest(&record);
-        projected.push(native_parameter_values::project(&record));
-        Ok(())
-    })?;
-    for p in &mut projected {
-        native_parameter_values::resolve(p, &links);
-    }
-    native_parameter_values::mirror_owners(&mut projected);
+    let (projected, summary) = native_parameter_values::extract_values(&mut rf, &options, |_| {})?;
     let mut elements = Vec::new();
     for p in projected {
         if !p.values.is_empty() {

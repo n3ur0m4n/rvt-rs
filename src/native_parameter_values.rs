@@ -28,12 +28,14 @@
 //! `None` and `diagnostic` says why. So are the names the API localizes
 //! (system family names, empty saved type names). Nothing is evaluated here.
 
+use crate::RevitFile;
 use crate::native_class_categories::{
     class_category, class_exposes_ifc_export, family_category_exposes_ifc_export,
 };
-use crate::native_document::Record;
+use crate::native_document::{Options, Record, Summary};
 use crate::native_metadata::identifier;
 use crate::native_parameters::{GraphObject, ObjectGraph};
+use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -1542,4 +1544,28 @@ pub fn mirror_owners(projected: &mut [Projected]) {
             }
         }
     }
+}
+
+/// The whole projection: extracts every record, projects its values,
+/// resolves them against the other records and mirrors owners' values.
+/// `on_record` sees each record before it is dropped, for callers that need
+/// more of it than its values.
+pub fn extract_values(
+    file: &mut RevitFile,
+    options: &Options,
+    mut on_record: impl FnMut(&Record),
+) -> Result<(Vec<Projected>, Summary)> {
+    let mut links = Links::default();
+    let mut projected = Vec::new();
+    let summary = crate::native_document::extract(file, options, |record| {
+        on_record(&record);
+        links.ingest(&record);
+        projected.push(project(&record));
+        Ok(())
+    })?;
+    for p in &mut projected {
+        resolve(p, &links);
+    }
+    mirror_owners(&mut projected);
+    Ok((projected, summary))
 }
