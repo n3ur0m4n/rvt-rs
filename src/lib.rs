@@ -166,6 +166,7 @@ pub mod identity;
 pub mod ifc;
 pub mod level_bind;
 pub mod metadata;
+pub mod native_class_categories;
 pub mod native_connectors;
 pub mod native_document;
 pub mod native_duct_shapes;

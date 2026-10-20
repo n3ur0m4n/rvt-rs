@@ -27,6 +27,7 @@ fn main() -> anyhow::Result<()> {
         let mut line = json!({
             "id": record.identity.element_id,
             "unique_id": record.identity.unique_id,
+            "owning_element_id": record.identity.owning_element_id,
             "class": record.class_name,
             "status": record.status,
             "diagnostic": record.diagnostic,

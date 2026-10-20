@@ -7,10 +7,9 @@
 //! carry only their negative `BuiltInParameter` id.
 
 use clap::Parser;
-use rvt::native_parameter_values::{self, ParameterValue};
+use rvt::native_parameter_values::{self, Links, ParameterValue};
 use rvt::{RevitFile, native_document};
 use serde::Serialize;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -26,7 +25,9 @@ struct Cli {
     /// Path to a `.rvt` / `.rfa` / `.rte` / `.rft` file.
     file: PathBuf,
 
-    /// Only these element ids (repeatable). Default: every element.
+    /// Only these element ids (repeatable). Default: every element. The
+    /// values other records contribute (category of a family instance, host
+    /// class, ...) resolve only among the selected records.
     #[arg(long = "id")]
     ids: Vec<u64>,
 }
@@ -71,29 +72,24 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     let mut rf = RevitFile::open(&cli.file)?;
     let mut options = native_document::Options::default();
     options.selected_ids.extend(cli.ids);
-    let mut elements = Vec::new();
-    let mut classes = HashMap::new();
+    let mut links = Links::default();
+    let mut projected = Vec::new();
     let summary = native_document::extract(&mut rf, &options, |record| {
-        if let Some(class) = &record.class_name {
-            classes.insert(record.identity.element_id, class.clone());
-        }
-        let parameters = native_parameter_values::project(&record);
-        if !parameters.is_empty() {
-            elements.push(ElementOut {
-                id: record.identity.element_id,
-                unique_id: record.identity.unique_id.clone(),
-                class_name: record.class_name.clone(),
-                parameters,
-            });
-        }
+        links.ingest(&record);
+        projected.push(native_parameter_values::project(&record));
         Ok(())
     })?;
-    for element in &mut elements {
-        native_parameter_values::resolve_hosts(&mut element.parameters, |id| {
-            u64::try_from(id)
-                .ok()
-                .and_then(|id| classes.get(&id).cloned())
-        });
+    let mut elements = Vec::new();
+    for mut p in projected {
+        native_parameter_values::resolve(&mut p, &links);
+        if !p.values.is_empty() {
+            elements.push(ElementOut {
+                id: p.element_id,
+                unique_id: p.unique_id,
+                class_name: p.class_name,
+                parameters: p.values.into_values().collect(),
+            });
+        }
     }
     let definitions = summary
         .parameter_definitions
