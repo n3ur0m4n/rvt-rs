@@ -105,9 +105,13 @@ const TYPE_ID_FIELDS: &[(&str, &str)] = &[
     ("SpanDirectionSymbol", "m_symbolId"),
     ("SpotElevation", "m_styleSymbolId"),
     ("SweepHost", "m_typeId"),
+    ("TextNote", "m_attrId"),
+    ("Viewport", "m_attrId"),
 ];
 /// Type id held by a field of the one object of this class in the graph.
 const TYPE_ID_OBJECTS: &[(&str, &str, &str)] = &[
+    ("CurveElem", "RepeatingDetailUserData", "m_symbolId"),
+    ("ElementGroup", "GroupAssocMembership", "m_groupId"),
     ("GeoLocation", "InstanceInfo", "m_symbolId"),
     ("ImportInstance", "InstanceInfo", "m_symbolId"),
     ("PointCloudInstance", "InstanceInfo", "m_symbolId"),
