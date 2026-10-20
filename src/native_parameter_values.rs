@@ -152,13 +152,22 @@ const TEXT_NOTE_TYPE_FIELDS: &[(&str, i64, &str)] = &[
 /// Root fields of a view (`DBView*` records with a name).
 const VIEW_FIELDS: &[(&str, i64, &str)] = &[
     ("m_fixedSketchPlaneId", -1005147, "ElementId"), // VIEW_FIXED_SKETCH_PLANE
+    ("m_viewDescription", -1005114, "String"),       // VIEW_DESCRIPTION
     ("m_viewName", -1005112, "String"),              // VIEW_NAME
+    ("m_viewTemplateId", -1005176, "ElementId"),     // VIEW_TEMPLATE
 ];
+const VIEW_SHOW_HIDDEN_LINES: i64 = -1154613;
+const CONCEPTUAL_CONSTRUCTION_MATERIAL: i64 = -1012024;
 /// Root fields of a plan view only.
 const PLAN_VIEW_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_bUseTrueNorth", -1005168, "Integer"), // PLAN_VIEW_NORTH
+    ("m_columnSymbolElev", -1150170, "Double"), // VIEW_SLANTED_COLUMN_SYMBOL_OFFSET
     ("m_idUnderlayLevel", -1005153, "ElementId"), // VIEW_UNDERLAY_BOTTOM_ID
     ("m_idUnderlayTopLevel", -1005335, "ElementId"), // VIEW_UNDERLAY_TOP_ID
+    ("m_underlayOrientation", -1005177, "Integer"), // VIEW_UNDERLAY_ORIENTATION
 ];
+/// Views whose `ViewDisplayMgr.m_model.m_showHiddenLinesVal` is measured.
+const HIDDEN_LINES_VIEW_CLASSES: &[&str] = &["DBView3d", "DBViewPlan", "DBViewSection"];
 const VIEW_CLASSES: &[&str] = &[
     "DBView3d",
     "DBViewAnonDrafting",
@@ -466,7 +475,13 @@ pub fn project(record: &Record) -> Projected {
                     name.diagnostic = Some("default_zone_name_localized_by_api");
                 }
             }
-            "DimensionStyle" => {
+            // The API lists these only on the user-visible dimension types
+            // (the internal and unnamed ones report no settings).
+            "DimensionStyle"
+                if values
+                    .get(&ALL_MODEL_TYPE_NAME)
+                    .is_some_and(|name| name.value.is_some()) =>
+            {
                 saved_fields(root, DIMENSION_STYLE_FIELDS, &mut values);
                 if let Some(attributes) = root
                     .fields
@@ -497,6 +512,18 @@ pub fn project(record: &Record) -> Projected {
                 if let Some(category) = root_identifier(root, "m_massSurfaceSubCategoryId") {
                     set_category(&mut values, category, "saved_field");
                 }
+                if let Some(material) = root_identifier(root, "m_materialId") {
+                    values
+                        .entry(CONCEPTUAL_CONSTRUCTION_MATERIAL)
+                        .or_insert_with(|| {
+                            ParameterValue::new(
+                                CONCEPTUAL_CONSTRUCTION_MATERIAL,
+                                "ElementId",
+                                Value::from(material),
+                                "saved_field",
+                            )
+                        });
+                }
             }
             "FabricationPart" => {
                 if let Some(category) = root_identifier(root, "m_categoryId") {
@@ -512,9 +539,29 @@ pub fn project(record: &Record) -> Projected {
             _ => {}
         }
         if VIEW_CLASSES.contains(&class) {
-            saved_fields(root, VIEW_FIELDS, &mut values);
-            if class == "DBViewPlan" {
-                saved_fields(root, PLAN_VIEW_FIELDS, &mut values);
+            // A view template's name and template settings are not listed by
+            // the API; its hidden-line mode is.
+            if root.fields.get("m_isTemplate") != Some(&Value::Bool(true)) {
+                saved_fields(root, VIEW_FIELDS, &mut values);
+                if class == "DBViewPlan" {
+                    saved_fields(root, PLAN_VIEW_FIELDS, &mut values);
+                }
+            }
+            if HIDDEN_LINES_VIEW_CLASSES.contains(&class) {
+                if let Some(mode) = unique_object(graph, "ViewDisplayMgr")
+                    .and_then(|o| o.fields.get("m_model"))
+                    .and_then(|model| model.get("m_showHiddenLinesVal"))
+                    .and_then(Value::as_i64)
+                {
+                    values.entry(VIEW_SHOW_HIDDEN_LINES).or_insert_with(|| {
+                        ParameterValue::new(
+                            VIEW_SHOW_HIDDEN_LINES,
+                            "Integer",
+                            Value::from(mode),
+                            "saved_field",
+                        )
+                    });
+                }
             }
         }
     }
