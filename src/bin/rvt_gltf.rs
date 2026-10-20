@@ -55,6 +55,12 @@ struct Cli {
     /// display (#255). Slower on large files.
     #[arg(long)]
     saved_meshes: bool,
+
+    /// Draw every element from its saved display mesh where it has one,
+    /// adding elements rvt-rs does not export; rvt-rs bodies only where
+    /// there is no saved mesh. Implies --saved-meshes.
+    #[arg(long)]
+    saved_first: bool,
 }
 
 fn main() -> ExitCode {
@@ -102,7 +108,16 @@ fn run(cli: &Cli) -> Result<(), String> {
     let mut model = RvtDocExporter
         .export(&mut rf)
         .map_err(|e| format!("export {}: {e}", input.display()))?;
-    if cli.saved_meshes {
+    if cli.saved_first {
+        match rvt::ifc::saved_meshes::attach_all(&mut rf, &mut model) {
+            Ok(report) if cli.verbose => println!(
+                "rvt-gltf: saved meshes: {} drawable, {} replaced, {} added, {} ambiguous",
+                report.drawable, report.replaced, report.added, report.ambiguous
+            ),
+            Ok(_) => {}
+            Err(e) => eprintln!("rvt-gltf: saved graphics not read, bodies unchanged: {e}"),
+        }
+    } else if cli.saved_meshes {
         if let Err(e) = rvt::ifc::saved_meshes::attach(&mut rf, &mut model) {
             eprintln!("rvt-gltf: saved graphics not read, bodies unchanged: {e}");
         }
