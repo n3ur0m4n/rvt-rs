@@ -120,6 +120,98 @@ const PARAMETER_STORES: &[(&str, &str, &str)] = &[
     ("Rebar", "RebarInstance", "m_params"),
     ("RebarShape", "RebarShape", "m_instanceParams"),
 ];
+/// Root fields of a dimension type (`DimensionStyle`), `(field, parameter id,
+/// storage)`; a bool field is an Integer 0/1 parameter.
+const DIMENSION_STYLE_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_arrowHeadStyleId", -1006323, "ElementId"), // DIM_LEADER_ARROWHEAD
+    ("m_centerlineTickMarkStyleId", -1006445, "ElementId"), // DIM_STYLE_CENTERLINE_TICK_MARK
+    ("m_dimLineSnapDist", -1006446, "Double"),     // DIM_STYLE_DIM_LINE_SNAP_DIST
+    ("m_dimWitnCntrlExtBelow", -1006432, "Integer"), // DIM_WITNS_LINE_CNTRL
+    ("m_equalityText", -1006512, "String"),        // EQUALITY_TEXT_FOR_CONTINUOUS_LINEAR_DIM
+    ("m_interiorTickMarkStyleId", -1006464, "ElementId"), // DIM_STYLE_INTERIOR_TICK_MARK
+    ("m_leaderDisplayCondition", -1006510, "Integer"), // DIM_LEADER_DISPLAY_CONDITION
+    ("m_leaderType", -1006508, "Integer"),         // DIM_LEADER_TYPE
+    ("m_linearDimType", -1006467, "Integer"),      // LINEAR_DIM_TYPE
+    ("m_showOpeningHt", -1006435, "Integer"),      // DIM_STYLE_SHOW_OPENING_HT
+    ("m_textAlignment", -1006448, "Integer"),      // DIM_STYLE_READ_CONVENTION
+    ("m_txtBackgroundTransparent", -1006429, "Integer"), // DIM_TEXT_BACKGROUND
+];
+/// Fields of a `LineAndTextAttr` (the text attributes of a dimension or text
+/// type). On a dimension type the parameter sets hold a stale 0 for these:
+/// the API reads the attributes, so they replace the saved slots.
+const LINE_AND_TEXT_ATTR_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_bBold", -1006311, "Integer"),      // TEXT_STYLE_BOLD
+    ("m_bItalic", -1006312, "Integer"),    // TEXT_STYLE_ITALIC
+    ("m_bUnderline", -1006313, "Integer"), // TEXT_STYLE_UNDERLINE
+];
+/// Root fields of a text note type (`TextNoteAttributes`).
+const TEXT_NOTE_TYPE_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_leaderOffsetSheet", -1006501, "Double"), // LEADER_OFFSET_SHEET
+    ("m_textBoxVisibility", -1150213, "Integer"), // TEXT_BOX_VISIBILITY
+];
+/// Root fields of a view (`DBView*` records with a name).
+const VIEW_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_fixedSketchPlaneId", -1005147, "ElementId"), // VIEW_FIXED_SKETCH_PLANE
+    ("m_viewName", -1005112, "String"),              // VIEW_NAME
+];
+/// Root fields of a plan view only.
+const PLAN_VIEW_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_idUnderlayLevel", -1005153, "ElementId"), // VIEW_UNDERLAY_BOTTOM_ID
+    ("m_idUnderlayTopLevel", -1005335, "ElementId"), // VIEW_UNDERLAY_TOP_ID
+];
+const VIEW_CLASSES: &[&str] = &[
+    "DBView3d",
+    "DBViewAnonDrafting",
+    "DBViewDrafting",
+    "DBViewLegend",
+    "DBViewPlan",
+    "DBViewSchedule",
+    "DBViewSection",
+];
+/// Sub-elements whose API parameters are those of their owner
+/// (`Identity.owning_element_id`): `(class, owner class, built-in ids
+/// mirrored, custom parameters mirrored)`. Measured: every listed value equal
+/// to the owner's on every element of the corpus.
+const OWNER_MIRRORS: &[(&str, &str, &[i64], bool)] = &[
+    (
+        "PipeFittingCenterLine",
+        "FamilyInstance",
+        &[
+            -1001352, // FAMILY_LEVEL_PARAM
+            -1012100, // PHASE_CREATED
+            -1012101, // PHASE_DEMOLISHED
+            -1019000, // IFC_GUID
+            -1114242, // RBS_FAMILY_CONTENT_ANNOTATION_DISPLAY
+        ],
+        true,
+    ),
+    (
+        "SegmentCenterLine",
+        "RbsPipeCurve",
+        &[
+            -1012100, // PHASE_CREATED
+            -1012101, // PHASE_DEMOLISHED
+            -1019000, // IFC_GUID
+            -1114000, // RBS_START_LEVEL_PARAM
+            -1114240, // RBS_CALCULATED_SIZE
+            -1140212, // RBS_PIPE_INNER_DIAM_PARAM
+            -1140225, // RBS_PIPE_DIAMETER_PARAM
+            -1140238, // RBS_PIPE_OUTER_DIAMETER
+            -1140334, // RBS_PIPING_SYSTEM_TYPE_PARAM
+            -1150434, // RBS_REFERENCE_OVERALLSIZE
+        ],
+        false,
+    ),
+];
+const OST_DIMENSIONS: i64 = -2000260;
+const OST_SKETCH_DIMENSIONS: i64 = -2000261;
+const OST_CONSTRAINTS: i64 = -2000262;
+const OST_SPOT_ELEVATIONS: i64 = -2000263;
+const OST_SPOT_SLOPES: i64 = -2000265;
+const OST_LINES: i64 = -2000051;
+const OST_SKETCH_LINES: i64 = -2000045;
+const OST_DETAIL_COMPONENTS: i64 = -2002000;
+
 /// Classes whose root `m_text` is the datum name (`DATUM_TEXT`).
 const DATUM_TEXT_CLASSES: &[&str] = &["Grid", "Level", "RefPlane"];
 /// Root field holding the family name of a type, where the file saves it.
@@ -165,7 +257,8 @@ pub struct ParameterValue {
     pub storage_type: String,
     pub value: Option<Value>,
     /// `parameter_set`, `saved_field`, `family_slot` or `parameter_store`
-    /// (compact store of a rebar) for saved values;
+    /// (compact store of a rebar) for saved values; `owner` for a value
+    /// mirrored from the owning element;
     /// `class_table` for the category of the class; `resolved` for a value
     /// read from another record (family, type); `default_verified` for the
     /// value the API reports when nothing is saved; `derived_unique_id` for
@@ -211,6 +304,10 @@ pub struct Projected {
     family_id: Option<i64>,
     /// `m_dbViewId` of a `Viewer`: the view whose category it reports.
     view_id: Option<i64>,
+    /// The element this one belongs to (`Identity.owning_element_id`).
+    owner: Option<u64>,
+    /// A `CurveElem` saved as a detail curve (`m_detail`).
+    detail_curve: bool,
 }
 
 /// What other records contribute to a record's values: the class of every
@@ -223,6 +320,8 @@ pub struct Links {
     category_of_family: HashMap<i64, i64>,
     name_of_family: HashMap<i64, String>,
     footing_type_of_floor_type: HashMap<i64, i64>,
+    /// `m_dimensionStyleType` of a `SpotElevationStyle`: 4 elevation, 8 slope.
+    spot_style_kind: HashMap<i64, i64>,
 }
 
 impl Links {
@@ -255,6 +354,15 @@ impl Links {
             "FloorAttributes" => {
                 if let Some(footing) = root.fields.get("m_footingType").and_then(Value::as_i64) {
                     self.footing_type_of_floor_type.insert(id, footing);
+                }
+            }
+            "SpotElevationStyle" => {
+                if let Some(kind) = root
+                    .fields
+                    .get("m_dimensionStyleType")
+                    .and_then(Value::as_i64)
+                {
+                    self.spot_style_kind.insert(id, kind);
                 }
             }
             _ => {}
@@ -314,6 +422,7 @@ pub fn project(record: &Record) -> Projected {
     let is_type = root.is_some_and(|root| root.fields.get("m_symbolInfo").is_some());
     let mut family_id = None;
     let mut view_id = None;
+    let mut detail_curve = false;
     if let (Some(graph), Some(root)) = (&record.graph, root) {
         parameter_store(class, graph, root, &mut values);
         type_id(class, graph, root, &mut values);
@@ -357,7 +466,56 @@ pub fn project(record: &Record) -> Projected {
                     name.diagnostic = Some("default_zone_name_localized_by_api");
                 }
             }
+            "DimensionStyle" => {
+                saved_fields(root, DIMENSION_STYLE_FIELDS, &mut values);
+                if let Some(attributes) = root
+                    .fields
+                    .get("m_pLineAndTextAttr")
+                    .and_then(|pointer| pointer_target(graph, 0, pointer))
+                    .filter(|o| o.class_name == "LineAndTextAttr")
+                {
+                    text_attributes(&attributes.fields, &mut values);
+                }
+            }
+            "TextNoteAttributes" => {
+                saved_fields(root, TEXT_NOTE_TYPE_FIELDS, &mut values);
+                if let Some(attributes) = root.fields.get("m_lineAndTextAttr") {
+                    text_attributes(attributes, &mut values);
+                }
+            }
+            "LinearDimString" | "RadialDim" => {
+                if let Some(category) = root
+                    .fields
+                    .get("m_flags")
+                    .and_then(Value::as_i64)
+                    .map(dimension_category)
+                {
+                    set_category(&mut values, category, "saved_field");
+                }
+            }
+            "ConceptualConstructionType" => {
+                if let Some(category) = root_identifier(root, "m_massSurfaceSubCategoryId") {
+                    set_category(&mut values, category, "saved_field");
+                }
+            }
+            "FabricationPart" => {
+                if let Some(category) = root_identifier(root, "m_categoryId") {
+                    set_category(&mut values, category, "saved_field");
+                }
+            }
+            "CurveElem" => {
+                if unique_object(graph, "RepeatingDetailUserData").is_some() {
+                    set_category(&mut values, OST_DETAIL_COMPONENTS, "saved_field");
+                }
+                detail_curve = root.fields.get("m_detail") == Some(&Value::Bool(true));
+            }
             _ => {}
+        }
+        if VIEW_CLASSES.contains(&class) {
+            saved_fields(root, VIEW_FIELDS, &mut values);
+            if class == "DBViewPlan" {
+                saved_fields(root, PLAN_VIEW_FIELDS, &mut values);
+            }
         }
     }
     for v in values.values_mut() {
@@ -372,6 +530,39 @@ pub fn project(record: &Record) -> Projected {
         derived_default_ifc_guid: record.derived_default_ifc_guid.clone(),
         family_id,
         view_id,
+        owner: u64::try_from(record.identity.owning_element_id).ok(),
+        detail_curve,
+    }
+}
+
+/// The text attributes of a dimension or text type, replacing the saved
+/// slots (stale on dimension types).
+fn text_attributes(attributes: &Value, values: &mut BTreeMap<i64, ParameterValue>) {
+    for &(field, parameter_id, storage) in LINE_AND_TEXT_ATTR_FIELDS {
+        if let Some(flag) = attributes.get(field).and_then(Value::as_bool) {
+            values.insert(
+                parameter_id,
+                ParameterValue::new(
+                    parameter_id,
+                    storage,
+                    Value::from(i64::from(flag)),
+                    "saved_field",
+                ),
+            );
+        }
+    }
+}
+
+/// A dimension's category from its `m_flags`: bit 4 marks a sketch
+/// dimension, bit 6 a constraint (measured on 1.038 dimensions of the
+/// corpus: 12 and 140 dimensions, 28 sketch, 76 constraints).
+fn dimension_category(flags: i64) -> i64 {
+    if flags & 0x40 != 0 {
+        OST_CONSTRAINTS
+    } else if flags & 0x10 != 0 {
+        OST_SKETCH_DIMENSIONS
+    } else {
+        OST_DIMENSIONS
     }
 }
 
@@ -389,7 +580,10 @@ fn saved_fields(
         let value = match storage {
             "ElementId" => identifier(raw).ok().map(Value::from),
             "Double" => raw.is_number().then(|| raw.clone()),
-            "Integer" => raw.as_i64().map(Value::from),
+            "Integer" => raw
+                .as_i64()
+                .or_else(|| raw.as_bool().map(i64::from))
+                .map(Value::from),
             "String" => raw.is_string().then(|| raw.clone()),
             _ => None,
         };
@@ -729,6 +923,31 @@ pub fn resolve(p: &mut Projected, links: &Links) {
             set_category(&mut p.values, category, "resolved");
         }
     }
+    if class == "SpotElevation" {
+        if let Some(category) = type_id
+            .and_then(|style| links.spot_style_kind.get(&style))
+            .and_then(|kind| match kind {
+                4 => Some(OST_SPOT_ELEVATIONS),
+                8 => Some(OST_SPOT_SLOPES),
+                _ => None,
+            })
+        {
+            set_category(&mut p.values, category, "resolved");
+        }
+    }
+    // A curve in a sketch is a sketch line; a detail curve outside one is a
+    // line. Model lines and area boundaries are not told apart yet.
+    if class == "CurveElem" {
+        let owner_class = p
+            .owner
+            .and_then(|owner| links.classes.get(&owner))
+            .map(String::as_str);
+        match (owner_class, p.detail_curve) {
+            (Some("VarSketch"), _) => set_category(&mut p.values, OST_SKETCH_LINES, "resolved"),
+            (None, true) => set_category(&mut p.values, OST_LINES, "resolved"),
+            _ => {}
+        }
+    }
     // A viewer (section mark, elevation arrow, camera) reports its view's category.
     if let Some(category) = p
         .view_id
@@ -789,5 +1008,55 @@ fn ifc_export_defaults(p: &mut Projected, family_based: bool) {
                 "derived_unique_id",
             )
         });
+    }
+}
+
+/// Third pass: a sub-element listed in [`OWNER_MIRRORS`] reports its owner's
+/// values for the parameters the API mirrors, once every record is resolved.
+/// A value the sub-element already has (other than a withheld one) stays.
+pub fn mirror_owners(projected: &mut [Projected]) {
+    let index: HashMap<u64, usize> = projected
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.element_id, i))
+        .collect();
+    for i in 0..projected.len() {
+        let class = projected[i].class_name.as_deref().unwrap_or("");
+        let Some(&(_, owner_class, builtins, custom)) =
+            OWNER_MIRRORS.iter().find(|(c, _, _, _)| *c == class)
+        else {
+            continue;
+        };
+        let Some(owner) = projected[i]
+            .owner
+            .and_then(|owner| index.get(&owner).copied())
+        else {
+            continue;
+        };
+        if projected[owner].class_name.as_deref() != Some(owner_class) {
+            continue;
+        }
+        let mirrored: Vec<ParameterValue> = projected[owner]
+            .values
+            .values()
+            .filter(|v| v.value.is_some())
+            .filter(|v| (custom && v.parameter_id > 0) || builtins.contains(&v.parameter_id))
+            .map(|v| ParameterValue {
+                parameter_id: v.parameter_id,
+                storage_type: v.storage_type.clone(),
+                value: v.value.clone(),
+                source: "owner",
+                diagnostic: None,
+            })
+            .collect();
+        let values = &mut projected[i].values;
+        for v in mirrored {
+            match values.get(&v.parameter_id) {
+                Some(existing) if existing.value.is_some() => {}
+                _ => {
+                    values.insert(v.parameter_id, v);
+                }
+            }
+        }
     }
 }

@@ -79,9 +79,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         projected.push(native_parameter_values::project(&record));
         Ok(())
     })?;
+    for p in &mut projected {
+        native_parameter_values::resolve(p, &links);
+    }
+    native_parameter_values::mirror_owners(&mut projected);
     let mut elements = Vec::new();
-    for mut p in projected {
-        native_parameter_values::resolve(&mut p, &links);
+    for p in projected {
         if !p.values.is_empty() {
             elements.push(ElementOut {
                 id: p.element_id,
