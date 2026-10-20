@@ -295,7 +295,13 @@ impl Walker<'_, '_> {
                 if obj.fields["m_resolveSymInView"].as_bool() != Some(false) {
                     return Err("view-resolved instance is unsupported".into());
                 }
-                if obj.fields["m_forbiddenTarget"]["m_targets"].as_u64() != Some(0) {
+                // 10: 49 special-equipment instances of a 2025 MEP model,
+                // drawn as the API geometry within 0.0054 ft (2026-10-20).
+                // 53246 marks model groups, whose members draw themselves.
+                if !matches!(
+                    obj.fields["m_forbiddenTarget"]["m_targets"].as_u64(),
+                    Some(0 | 10)
+                ) {
                     return Err("instance target restrictions are unsupported".into());
                 }
                 let info = self.target(index, &obj.fields["m_instanceInfo"])?;

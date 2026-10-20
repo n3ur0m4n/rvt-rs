@@ -43,6 +43,11 @@ fn main() -> anyhow::Result<()> {
                 "status": element.status,
                 "vertices": vertices,
                 "triangles": triangles,
+                "diagnostics": element.meshes.diagnostics,
+                "unbounded_faces": element.meshes.unbounded_faces,
+                "rejected_filters": element.meshes.rejected_filters,
+                "excluded_visibility_branches": element.meshes.excluded_visibility_branches,
+                "excluded_non_surface_branches": element.meshes.excluded_non_surface_branches,
             }),
         )?;
         writeln!(out)?;

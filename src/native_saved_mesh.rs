@@ -254,7 +254,7 @@ fn refined_plane_edge(
         .resolve(other, &g.objects[other].fields["m_pSurf"])?
         .context("shared edge surface missing")?;
     let kind = g.objects[other_surface].class_name.as_str();
-    if !matches!(kind, "CylSurf" | "SurfRev" | "RuledSurf") {
+    if !matches!(kind, "CylSurf" | "SurfRev" | "RuledSurf" | "HermiteSurf") {
         return Ok(original);
     }
     type SurfaceEval = Box<dyn Fn([f64; 2]) -> Result<[f64; 3]>>;
@@ -299,11 +299,11 @@ fn refined_plane_edge(
         });
         (us, vs, eval)
     } else {
-        let grid = crate::native_parametric_mesh::face_grid(g, other)?;
+        let (surface, us, vs) = crate::native_parametric_mesh::face_knots(g, other)?;
         (
-            grid.u,
-            grid.v,
-            Box::new(move |uv: [f64; 2]| grid.surface.evaluate(uv[0], uv[1])),
+            us,
+            vs,
+            Box::new(move |uv: [f64; 2]| surface.evaluate(uv[0], uv[1])),
         )
     };
     let ends = edge.fields["m_firstAndLastEdgePnts"]
@@ -325,7 +325,9 @@ fn refined_plane_edge(
     } else if (start[0] - end[0]).abs() < 1e-7 && (start[1] - end[1]).abs() > 1e-7 {
         1
     } else {
-        bail!("shared curved edge is not an isoparametric interval")
+        // A curve across the grid (a sloped cut of a curved wall) stays as
+        // saved; the curved side meets it within its chord error.
+        return Ok(original);
     };
     ensure!(
         samples
@@ -412,21 +414,18 @@ fn inside(p: [f64; 2], r: &[[f64; 2]]) -> bool {
     }
     hit
 }
-fn ring(
-    g: &ObjectGraph,
-    index: &PointerIndex<'_>,
-    face: usize,
-    li: usize,
-) -> Result<Vec<[f64; 2]>> {
-    ring_impl(g, index, face, li, false)
-}
+/// Two edge ends meeting in model space although not in UV.
+pub(crate) type Meets<'a> = &'a dyn Fn([f64; 2], [f64; 2]) -> Result<bool>;
 fn ring_impl(
     g: &ObjectGraph,
     index: &PointerIndex<'_>,
     face: usize,
     li: usize,
     refine_plane: bool,
+    weld: f64,
+    meets: Option<Meets<'_>>,
 ) -> Result<Vec<[f64; 2]>> {
+    let close = |a: [f64; 2], b: [f64; 2]| (a[0] - b[0]).hypot(a[1] - b[1]) < weld;
     let l = &g.objects[li];
     ensure!(
         ["EdgeLoop", "EdgeLoopWithChainEnvelopes"].contains(&l.class_name.as_str()),
@@ -472,7 +471,23 @@ fn ring_impl(
         }
         pts.push(point::<2>(&endpoints[1]["uv"][side])?);
         if refine_plane {
-            pts = refined_plane_edge(g, index, face, cur, side, pts)?;
+            // The saved polyline is itself boundary data: where a freeform
+            // neighbour's approximate samples do not refine it exactly, it
+            // stays as saved, within that neighbour's chord error.
+            pts = match refined_plane_edge(g, index, face, cur, side, pts.clone()) {
+                Ok(refined) => refined,
+                Err(e)
+                    if [
+                        "shared edge surface samples disagree",
+                        "shared curved edge changes its fixed parameter",
+                        "shared curved edge leaves adjacent plane",
+                    ]
+                    .contains(&e.to_string().as_str()) =>
+                {
+                    pts
+                }
+                Err(e) => return Err(e),
+            };
         }
         segments.push(pts);
         cur = index
@@ -487,6 +502,12 @@ fn ring_impl(
         segments.iter().all(|s: &Vec<_>| !s.is_empty()),
         "empty boundary edge"
     );
+    // On a freeform surface the saved edge ends can miss each other in UV
+    // and still meet in model space; a side collapsed into a pole jumps
+    // in UV. There the loop keeps both ends and runs straight between them.
+    let joins = |a: [f64; 2], b: [f64; 2]| -> Result<bool> {
+        Ok(close(a, b) || meets.map(|m| m(a, b)).transpose()?.unwrap_or(false))
+    };
     let mut output = None;
     for reverse in [false, true] {
         let mut out = segments[0].clone();
@@ -496,17 +517,24 @@ fn ring_impl(
         let mut valid = true;
         for s in &segments[1..] {
             let last = *out.last().unwrap();
-            if close(last, s[0]) {
+            let (first_end, last_end) = (s[0], *s.last().unwrap());
+            if close(last, first_end) {
                 out.extend_from_slice(&s[1..])
-            } else if close(last, *s.last().unwrap()) {
+            } else if close(last, last_end) {
                 out.extend(s.iter().rev().skip(1).copied())
+            } else if joins(last, first_end)? {
+                out.extend_from_slice(s)
+            } else if joins(last, last_end)? {
+                out.extend(s.iter().rev().copied())
             } else {
                 valid = false;
                 break;
             }
         }
-        if valid && close(out[0], *out.last().unwrap()) {
-            out.pop();
+        if valid && joins(out[0], *out.last().unwrap())? {
+            if close(out[0], *out.last().unwrap()) {
+                out.pop();
+            }
             output = Some(out);
             break;
         }
@@ -573,7 +601,10 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
             CylinderTessellationProfile::default(),
         )?));
     }
-    if matches!(p.class_name.as_str(), "SurfRev" | "RuledSurf") {
+    if matches!(
+        p.class_name.as_str(),
+        "SurfRev" | "RuledSurf" | "HermiteSurf"
+    ) {
         return Ok(Some(crate::native_parametric_mesh::face(g, fi)?));
     }
     ensure!(
@@ -602,7 +633,9 @@ fn face_indexed(g: &ObjectGraph, index: &PointerIndex<'_>, fi: usize) -> Result<
     let mut seen = BTreeSet::new();
     loop {
         ensure!(seen.insert(li), "loop-list cycle");
-        loops.push(ring_impl(g, index, fi, li, true)?);
+        // Plane UV is model feet: saved edge ends that miss each other by
+        // ~1e-5 ft are welded within 1e-4 ft.
+        loops.push(ring_impl(g, index, fi, li, true, 1e-4, None)?);
         match index.resolve(li, &g.objects[li].fields["m_nextLoop"])? {
             Some(next) => li = next,
             None => break,
@@ -803,16 +836,8 @@ pub fn cylinder_face(
             && v_range[1] > v_range[0],
         "invalid cylinder envelope or seam crossing"
     );
-    let loop_index = index
-        .resolve(fi, &face.fields["m_pFirstLoop"])?
-        .context("cylinder trim loop")?;
-    ensure!(
-        index
-            .resolve(loop_index, &g.objects[loop_index].fields["m_nextLoop"])?
-            .is_none(),
-        "multiple cylinder trim loops unsupported"
-    );
-    let trim_uv = ring(g, &index, fi, loop_index)?;
+    let loops = face_uv_loops(g, fi, None)?;
+    let trim_uv: Vec<[f64; 2]> = loops.concat();
     ensure!(!trim_uv.is_empty(), "empty cylinder trim");
     let mut trim_min = [f64::INFINITY; 2];
     let mut trim_max = [f64::NEG_INFINITY; 2];
@@ -827,59 +852,74 @@ pub fn cylinder_face(
         "degenerate cylinder trim"
     );
     let tol = 1e-7;
-    ensure!(trim_uv.len() >= 4, "nonrectangular cylinder trim");
-    let mut covered = [0.; 4];
-    let mut perimeter = 0.;
-    for (a, b) in trim_uv
-        .iter()
-        .zip(trim_uv.iter().cycle().skip(1))
-        .take(trim_uv.len())
-    {
+    for a in &trim_uv {
         ensure!(
             a[0] >= u_range[0] - tol
                 && a[0] <= u_range[1] + tol
                 && a[1] >= v_range[0] - tol
-                && a[1] <= v_range[1] + tol
-                && b[0] >= u_range[0] - tol
-                && b[0] <= u_range[1] + tol
-                && b[1] >= v_range[0] - tol
-                && b[1] <= v_range[1] + tol,
+                && a[1] <= v_range[1] + tol,
             "cylinder trim outside envelope"
         );
-        let du = b[0] - a[0];
-        let dv = b[1] - a[1];
-        let length = du.hypot(dv);
-        ensure!(length > tol, "repeated cylinder trim vertex");
-        ensure!(
-            du.abs() < tol || dv.abs() < tol,
-            "nonrectangular cylinder trim"
-        );
-        let side = if dv.abs() < tol && (a[1] - trim_min[1]).abs() < tol {
-            0
-        } else if du.abs() < tol && (a[0] - trim_max[0]).abs() < tol {
-            1
-        } else if dv.abs() < tol && (a[1] - trim_max[1]).abs() < tol {
-            2
-        } else if du.abs() < tol && (a[0] - trim_min[0]).abs() < tol {
-            3
-        } else {
-            bail!("nonrectangular cylinder trim")
-        };
-        covered[side] += length;
-        perimeter += length;
     }
-    let expected_perimeter = 2. * ((trim_max[0] - trim_min[0]) + (trim_max[1] - trim_min[1]));
-    ensure!(
-        (perimeter - expected_perimeter).abs() <= tol * expected_perimeter.max(1.),
-        "incomplete or self-intersecting cylinder trim"
-    );
-    ensure!(
-        (covered[0] - (trim_max[0] - trim_min[0])).abs() <= tol
-            && (covered[1] - (trim_max[1] - trim_min[1])).abs() <= tol
-            && (covered[2] - (trim_max[0] - trim_min[0])).abs() <= tol
-            && (covered[3] - (trim_max[1] - trim_min[1])).abs() <= tol,
-        "incomplete cylinder trim perimeter"
-    );
+    // One rectangle is meshed as a grid; other loops by trimmed_grid_mesh.
+    let rectangular = (|| -> Result<()> {
+        ensure!(loops.len() == 1, "multiple cylinder trim loops unsupported");
+        let trim_uv = &loops[0];
+        ensure!(trim_uv.len() >= 4, "nonrectangular cylinder trim");
+        let mut covered = [0.; 4];
+        let mut perimeter = 0.;
+        for (a, b) in trim_uv
+            .iter()
+            .zip(trim_uv.iter().cycle().skip(1))
+            .take(trim_uv.len())
+        {
+            ensure!(
+                a[0] >= u_range[0] - tol
+                    && a[0] <= u_range[1] + tol
+                    && a[1] >= v_range[0] - tol
+                    && a[1] <= v_range[1] + tol
+                    && b[0] >= u_range[0] - tol
+                    && b[0] <= u_range[1] + tol
+                    && b[1] >= v_range[0] - tol
+                    && b[1] <= v_range[1] + tol,
+                "cylinder trim outside envelope"
+            );
+            let du = b[0] - a[0];
+            let dv = b[1] - a[1];
+            let length = du.hypot(dv);
+            ensure!(length > tol, "repeated cylinder trim vertex");
+            ensure!(
+                du.abs() < tol || dv.abs() < tol,
+                "nonrectangular cylinder trim"
+            );
+            let side = if dv.abs() < tol && (a[1] - trim_min[1]).abs() < tol {
+                0
+            } else if du.abs() < tol && (a[0] - trim_max[0]).abs() < tol {
+                1
+            } else if dv.abs() < tol && (a[1] - trim_max[1]).abs() < tol {
+                2
+            } else if du.abs() < tol && (a[0] - trim_min[0]).abs() < tol {
+                3
+            } else {
+                bail!("nonrectangular cylinder trim")
+            };
+            covered[side] += length;
+            perimeter += length;
+        }
+        let expected_perimeter = 2. * ((trim_max[0] - trim_min[0]) + (trim_max[1] - trim_min[1]));
+        ensure!(
+            (perimeter - expected_perimeter).abs() <= tol * expected_perimeter.max(1.),
+            "incomplete or self-intersecting cylinder trim"
+        );
+        ensure!(
+            (covered[0] - (trim_max[0] - trim_min[0])).abs() <= tol
+                && (covered[1] - (trim_max[1] - trim_min[1])).abs() <= tol
+                && (covered[2] - (trim_max[0] - trim_min[0])).abs() <= tol
+                && (covered[3] - (trim_max[1] - trim_min[1])).abs() <= tol,
+            "incomplete cylinder trim perimeter"
+        );
+        Ok(())
+    })();
     // Keep a full-turn trim from collapsing to coincident seam vertices when a
     // deliberately coarse profile is supplied. This is a geometric validity
     // bound, independent of the analytic chord-error policy.
@@ -937,6 +977,47 @@ pub fn cylinder_face(
             center[2] + radius * (c * x_vec[2] + s * y_vec[2]) + v * z_vec[2],
         ]
     };
+    if let Err(e) = rectangular {
+        ensure!(
+            e.to_string().starts_with("nonrectangular")
+                || e.to_string().starts_with("multiple")
+                || e.to_string().starts_with("incomplete"),
+            e
+        );
+        let surface = |u: f64, v: f64| -> Result<([f64; 3], [f64; 3])> {
+            let (s, c) = u.sin_cos();
+            let n = std::array::from_fn(|k| c * x_vec[k] + s * y_vec[k]);
+            Ok((eval(u, v), if orient { n } else { n.map(|x: f64| -x) }))
+        };
+        let (vertices, normals, triangles) = trimmed_grid_mesh(
+            &loops,
+            &u_values,
+            &v_values,
+            &surface,
+            orient,
+            MAX_GRID_VERTICES,
+        )?;
+        return Ok(FaceMesh {
+            face_index: fi,
+            face_tag: face.fields["m_GInfo"]["m_tag"].as_i64().unwrap_or(-1),
+            render_style_id: crate::native_metadata::identifier(&face.fields["m_renderStyleId"])?,
+            vertices,
+            triangles,
+            normal: normals[0],
+            normals,
+            analytic_surface: Some(AnalyticCylinder {
+                center,
+                radius,
+                x_vec,
+                y_vec,
+                z_vec,
+                orient_flag: orient,
+                u_range,
+                v_range,
+            }),
+            trim_uv,
+        });
+    }
     let mut vertices = Vec::new();
     let mut normals = Vec::new();
     for &v in v_values.iter().take(nv + 1) {
@@ -1110,8 +1191,11 @@ pub fn graphics_with_resolver_at_detail<'a>(
                     .resolve(oi, &obj.fields["m_pFacetedTopology"])?
                     .context("faceted topology")?;
                 let topology = &g.objects[ti];
+                // FacetedTopology8 (fabrication parts) carries one normal per
+                // point instead of per facet.
                 ensure!(
-                    topology.class_name == "FacetedTopology0",
+                    ["FacetedTopology0", "FacetedTopology8"]
+                        .contains(&topology.class_name.as_str()),
                     "unsupported faceted topology"
                 );
                 let f = &topology.fields;
@@ -1146,11 +1230,16 @@ pub fn graphics_with_resolver_at_detail<'a>(
                         Ok(t)
                     })
                     .collect::<Result<Vec<_>>>()?;
+                let point_normals = topology.class_name == "FacetedTopology8";
                 ensure!(
-                    normals.is_empty() || normals.len() == triangles.len(),
+                    if point_normals {
+                        normals.len() == vertices.len()
+                    } else {
+                        normals.is_empty() || normals.len() == triangles.len()
+                    },
                     "unsupported normal cardinality"
                 );
-                let facet_normals = !normals.is_empty();
+                let facet_normals = !normals.is_empty() && !point_normals;
 
                 let mut expanded_vertices = Vec::new();
                 let mut expanded_normals = Vec::new();
@@ -1173,7 +1262,11 @@ pub fn graphics_with_resolver_at_detail<'a>(
                     };
                     for idx in t {
                         expanded_vertices.push(vertices[*idx as usize]);
-                        expanded_normals.push(normal);
+                        expanded_normals.push(if point_normals {
+                            normals[*idx as usize]
+                        } else {
+                            normal
+                        });
                     }
                     expanded_triangles.push([base, base + 1, base + 2]);
                 }
@@ -1251,4 +1344,211 @@ fn transform(p: &mut Primitive, m: [[f64; 4]; 4]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Every UV trim loop of a curved face, in loop-list order. With `meets`,
+/// edge ends that miss in UV but meet in model space still join.
+pub(crate) fn face_uv_loops(
+    g: &ObjectGraph,
+    fi: usize,
+    meets: Option<Meets<'_>>,
+) -> Result<Vec<Vec<[f64; 2]>>> {
+    let index = PointerIndex::new(g);
+    let f = g.objects.get(fi).context("face index")?;
+    let mut li = index
+        .resolve(fi, &f.fields["m_pFirstLoop"])?
+        .context("face loop")?;
+    let mut loops = Vec::new();
+    let mut seen = BTreeSet::new();
+    loop {
+        ensure!(seen.insert(li), "loop-list cycle");
+        loops.push(ring_impl(g, &index, fi, li, false, 1e-6, meets)?);
+        match index.resolve(li, &g.objects[li].fields["m_nextLoop"])? {
+            Some(next) => li = next,
+            None => break,
+        }
+    }
+    Ok(loops)
+}
+
+/// Mesh of a curved face bounded by any UV loops: outer rings with nested
+/// holes, as for planar faces. The loops are triangulated in UV, then each
+/// triangle is cut by the cells of the `us` x `vs` grid, which bounds the
+/// chord error as the rectangular path does. A triangle and a cell are both
+/// convex, so each piece is their exact intersection; a point on a shared
+/// triangle edge or grid line is computed once, so pieces stay conforming.
+/// `surface` returns the point and the oriented normal at (u, v); `winding`
+/// keeps counter-clockwise UV triangles as they are.
+#[allow(clippy::type_complexity)]
+pub(crate) fn trimmed_grid_mesh(
+    loops: &[Vec<[f64; 2]>],
+    us: &[f64],
+    vs: &[f64],
+    surface: &dyn Fn(f64, f64) -> Result<([f64; 3], [f64; 3])>,
+    winding: bool,
+    max_vertices: usize,
+) -> Result<(Vec<[f64; 3]>, Vec<[f64; 3]>, Vec<[u32; 3]>)> {
+    ensure!(!loops.is_empty(), "no trim loops");
+    ensure!(
+        us.len() >= 2
+            && vs.len() >= 2
+            && us.windows(2).all(|w| w[1] > w[0])
+            && vs.windows(2).all(|w| w[1] > w[0]),
+        "knots must be strictly increasing"
+    );
+    let depths: Vec<_> = loops
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            loops
+                .iter()
+                .enumerate()
+                .filter(|(j, s)| *j != i && inside(r[0], s))
+                .count()
+        })
+        .collect();
+    let mut uv_triangles = Vec::new();
+    for (i, outer) in loops
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| depths[*i] % 2 == 0)
+    {
+        let mut pts = outer.clone();
+        let mut holes = Vec::new();
+        let mut expected = area(outer).abs();
+        for (j, h) in loops.iter().enumerate() {
+            if depths[j] == depths[i] + 1 && inside(h[0], outer) {
+                holes.push(pts.len() as u32);
+                pts.extend_from_slice(h);
+                expected -= area(h).abs()
+            }
+        }
+        let mut ts = Vec::<u32>::new();
+        earcut::Earcut::new().earcut(pts.iter().copied(), &holes, &mut ts);
+        ensure!(
+            !ts.is_empty() && ts.len().is_multiple_of(3),
+            "triangulation failed"
+        );
+        let mut sum = 0.;
+        for t in ts.chunks_exact(3) {
+            ensure!(
+                t.iter().all(|i| (*i as usize) < pts.len()),
+                "triangle bounds"
+            );
+            let [a, b, c] = [pts[t[0] as usize], pts[t[1] as usize], pts[t[2] as usize]];
+            let signed = cross(a, b, c);
+            sum += signed.abs() / 2.;
+            if signed.abs() > 1e-14 {
+                uv_triangles.push(if signed > 0. { [a, b, c] } else { [a, c, b] });
+            }
+        }
+        // Loops joined in model space can cross themselves by a hair in
+        // UV; the triangles then overlap there by as little.
+        ensure!(
+            (sum - expected).abs() <= 1e-3 * expected.max(1.),
+            "triangulated area mismatch: {sum} vs {expected}"
+        );
+    }
+    // The cut of edge p-q at coordinate `value` of `axis`, from the
+    // lexicographically smaller end so both triangles of an edge agree.
+    let cut = |p: [f64; 2], q: [f64; 2], axis: usize, value: f64| {
+        let (a, b) = if (p[0], p[1]) <= (q[0], q[1]) {
+            (p, q)
+        } else {
+            (q, p)
+        };
+        let t = (value - a[axis]) / (b[axis] - a[axis]);
+        let mut r = [a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])];
+        r[axis] = value;
+        r
+    };
+    let clip = |poly: Vec<[f64; 2]>, axis: usize, value: f64, keep_above: bool| {
+        let within = |p: [f64; 2]| {
+            if keep_above {
+                p[axis] >= value
+            } else {
+                p[axis] <= value
+            }
+        };
+        let mut out = Vec::with_capacity(poly.len() + 1);
+        for k in 0..poly.len() {
+            let p = poly[k];
+            let q = poly[(k + 1) % poly.len()];
+            match (within(p), within(q)) {
+                (true, true) => out.push(q),
+                (true, false) => out.push(cut(p, q, axis, value)),
+                (false, true) => {
+                    out.push(cut(p, q, axis, value));
+                    out.push(q)
+                }
+                (false, false) => {}
+            }
+        }
+        out
+    };
+    let cells = |knots: &[f64], lo: f64, hi: f64| {
+        let first = knots.partition_point(|k| *k <= lo).saturating_sub(1);
+        let last = knots.partition_point(|k| *k < hi).min(knots.len() - 1);
+        first..last.max(first)
+    };
+    let key = |p: [f64; 2]| ((p[0] * 1e9).round() as i64, (p[1] * 1e9).round() as i64);
+    let mut ids = BTreeMap::<(i64, i64), u32>::new();
+    let mut vertices = Vec::new();
+    let mut normals = Vec::new();
+    let mut triangles = Vec::new();
+    for t in &uv_triangles {
+        let lo = [0, 1].map(|k| t.iter().map(|p| p[k]).fold(f64::INFINITY, f64::min));
+        let hi = [0, 1].map(|k| t.iter().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max));
+        for i in cells(us, lo[0], hi[0]) {
+            for j in cells(vs, lo[1], hi[1]) {
+                let mut poly = t.to_vec();
+                for (axis, value, above) in [
+                    (0, us[i], true),
+                    (0, us[i + 1], false),
+                    (1, vs[j], true),
+                    (1, vs[j + 1], false),
+                ] {
+                    if poly.len() < 3 {
+                        break;
+                    }
+                    poly = clip(poly, axis, value, above);
+                }
+                poly.dedup_by(|a, b| key(*a) == key(*b));
+                while poly.len() > 1 && key(poly[0]) == key(*poly.last().unwrap()) {
+                    poly.pop();
+                }
+                if poly.len() < 3 {
+                    continue;
+                }
+                let mut index_of = |p: [f64; 2]| -> Result<u32> {
+                    if let Some(id) = ids.get(&key(p)) {
+                        return Ok(*id);
+                    }
+                    ensure!(
+                        vertices.len() < max_vertices,
+                        "trimmed mesh vertex budget exceeded"
+                    );
+                    let (point, normal) = surface(p[0], p[1])?;
+                    let id = vertices.len() as u32;
+                    vertices.push(point);
+                    normals.push(normal);
+                    ids.insert(key(p), id);
+                    Ok(id)
+                };
+                for k in 1..poly.len() - 1 {
+                    let [a, b, c] = [poly[0], poly[k], poly[k + 1]];
+                    if cross(a, b, c) <= 1e-18 {
+                        continue;
+                    }
+                    let [x, y, z] = [index_of(a)?, index_of(b)?, index_of(c)?];
+                    if x == y || y == z || x == z {
+                        continue;
+                    }
+                    triangles.push(if winding { [x, y, z] } else { [x, z, y] });
+                }
+            }
+        }
+    }
+    ensure!(!triangles.is_empty(), "trimmed face produced no triangles");
+    Ok((vertices, normals, triangles))
 }

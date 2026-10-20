@@ -78,6 +78,20 @@ fn ruled_surface_component(
                     .is_some_and(|object| object.class_name == "Face")
             })
             .collect::<Vec<_>>();
+        // A boundary edge of an open face: one face, the other pointer null
+        // (seen on curved walls and roofs, 2026). It has no neighbour.
+        let null = |value: &serde_json::Value| {
+            matches!(
+                crate::native_saved_mesh::pointer(g, edge_index, value),
+                Ok(None)
+            )
+        };
+        if faces.len() == 2
+            && valid_faces.len() == 1
+            && faces.iter().filter(|f| null(f)).count() == 1
+        {
+            continue;
+        }
         if faces.len() != 2 || valid_faces.len() != 2 {
             invalid_by_face.extend(valid_faces);
             continue;
@@ -103,7 +117,6 @@ fn ruled_surface_component(
 }
 
 pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
-    use crate::native_parametric_surface::Curve;
     use crate::native_saved_mesh::pointer;
     let f = g.objects.get(fi).context("face index")?;
     ensure!(f.class_name == "Face", "not Face");
@@ -179,6 +192,9 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
             }
         }
     }
+    // Freeform edges are saved as approximations: their ends meet within
+    // a few 1e-5 ft on a Hermite surface. 1e-4 ft still tells a loop that
+    // closes from one that does not.
     let mut closes = false;
     for reverse in [false, true] {
         let first = if reverse {
@@ -196,9 +212,9 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
             let p = surface.evaluate(last[0], last[1])?;
             let a = seg[0];
             let b = *seg.last().unwrap();
-            if distance(p, surface.evaluate(a[0], a[1])?) < 1e-7 {
+            if distance(p, surface.evaluate(a[0], a[1])?) < 1e-4 {
                 last = b;
-            } else if distance(p, surface.evaluate(b[0], b[1])?) < 1e-7 {
+            } else if distance(p, surface.evaluate(b[0], b[1])?) < 1e-4 {
                 last = a;
             } else {
                 valid = false;
@@ -209,7 +225,7 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
             && distance(
                 surface.evaluate(first[0], first[1])?,
                 surface.evaluate(last[0], last[1])?,
-            ) < 1e-7
+            ) < 1e-4
         {
             closes = true;
             break;
@@ -275,12 +291,51 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
         }
         ensure!((end - max[axis]).abs() < 1e-7, "incomplete trim perimeter");
     }
+    let ([du, dv], [u_extra, v_extra]) = grid_steps(g, fi, &surface, min, max)?;
+    let axis = |k: usize, step: f64, extra: &[f64]| -> Result<Vec<f64>> {
+        let count = ((max[k] - min[k]) / step).ceil().max(1.);
+        ensure!(
+            count.is_finite() && count <= 10000.,
+            "parametric axis budget exceeded"
+        );
+        let count = count as usize;
+        let mut a = (0..=count)
+            .map(|i| min[k] + (max[k] - min[k]) * i as f64 / count as f64)
+            .collect::<Vec<_>>();
+        a.extend(extra.iter().filter(|x| **x > min[k] && **x < max[k]));
+        a.extend(trim.iter().map(|p| p[k]));
+        a.sort_by(f64::total_cmp);
+        a.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
+        Ok(a)
+    };
+    Ok(FaceGrid {
+        u: axis(0, du, &u_extra)?,
+        v: axis(1, dv, &v_extra)?,
+        surface,
+        trim,
+        bounds: [min, max],
+    })
+}
+
+/// U and V steps of the tessellation grid of a face over [min, max], plus
+/// knots each axis needs besides the even steps: chord error CHORD for
+/// revolutions; for ruled patches one normalized grid shared by the whole
+/// connected component; spline profiles and Hermite cells add their own
+/// span-wise cuts.
+fn grid_steps(
+    g: &ObjectGraph,
+    fi: usize,
+    surface: &ParametricSurface,
+    min: [f64; 2],
+    max: [f64; 2],
+) -> Result<([f64; 2], [Vec<f64>; 2])> {
+    use crate::native_parametric_surface::Curve;
     const CHORD: f64 = 0.001;
     let length = |p: [f64; 3]| p.iter().map(|x| x * x).sum::<f64>().sqrt();
     let angular = |r: f64| {
         (4. * (CHORD / (2. * r.max(CHORD))).min(1.).sqrt().asin()).min(std::f64::consts::FRAC_PI_2)
     };
-    let (du, dv) = match &surface {
+    Ok(match surface {
         ParametricSurface::SurfRev { profile, .. } => match profile {
             Curve::Line {
                 origin, direction, ..
@@ -289,17 +344,38 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
                     .into_iter()
                     .map(|v| (origin[0] + v * direction[0]).hypot(origin[1] + v * direction[1]))
                     .fold(0., f64::max);
-                (angular(radius), 1. / length(*direction))
+                (
+                    [angular(radius), 1. / length(*direction)],
+                    Default::default(),
+                )
             }
             Curve::Arc { center, radius, .. } => (
-                angular(center[0].hypot(center[1]) + 2. * radius),
-                angular(*radius),
+                [
+                    angular(center[0].hypot(center[1]) + 2. * radius),
+                    angular(*radius),
+                ],
+                Default::default(),
             ),
+            Curve::Hermite { .. } | Curve::Nurbs { .. } => {
+                // A spline meridian: the widest sampled radius sets the turn
+                // step, its largest second derivative the profile step.
+                let radius = (0..=256)
+                    .map(|k| {
+                        let q = profile.eval(min[1] + (max[1] - min[1]) * k as f64 / 256.);
+                        q[0].hypot(q[1])
+                    })
+                    .fold(0., f64::max);
+                (
+                    [angular(radius), f64::INFINITY],
+                    [vec![], profile.chord_params(CHORD)],
+                )
+            }
         },
         ParametricSurface::RuledSurf { .. } => {
             // A shared normalized grid across ruled patches preserves their
             // common straight generator edges even when profile lengths differ.
             let mut n = 1.0_f64;
+            let mut extra = Vec::new();
             let component = ruled_surface_component(g, fi)?;
             for i in component.into_iter().filter(|i| {
                 g.objects
@@ -317,35 +393,210 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
                 }
                 let s = ParametricSurface::read(g, surface_index)?;
                 let ParametricSurface::RuledSurf {
-                    profile1:
-                        Curve::Line {
-                            direction: a,
-                            range: ra,
-                            ..
-                        },
-                    profile2:
-                        Curve::Line {
-                            direction: b,
-                            range: rb,
-                            ..
-                        },
-                    ..
+                    profile1, profile2, ..
                 } = s
                 else {
-                    anyhow::bail!("nonlinear ruled profiles need a curvature policy")
+                    continue;
                 };
-                let da = std::array::from_fn(|k| a[k] * (ra[1] - ra[0]));
-                let db = std::array::from_fn(|k| b[k] * (rb[1] - rb[0]));
+                // Chord vector, length and the segments its curvature needs:
+                // a line is straight; an arc gets the revolution chord error.
+                let span = |c: &Curve| -> ([f64; 3], f64, f64) {
+                    match c {
+                        Curve::Line {
+                            direction, range, ..
+                        } => {
+                            let d = std::array::from_fn(|k| direction[k] * (range[1] - range[0]));
+                            (d, length(d), 1.)
+                        }
+                        Curve::Arc { radius, range, .. } => {
+                            let (a, b) = (c.eval(range[0]), c.eval(range[1]));
+                            let sweep = (range[1] - range[0]).abs();
+                            (
+                                std::array::from_fn(|k| b[k] - a[k]),
+                                radius * sweep,
+                                (sweep / angular(*radius)).ceil(),
+                            )
+                        }
+                        Curve::Hermite { range, .. } | Curve::Nurbs { range, .. } => {
+                            let at = |k: usize| {
+                                c.eval(range[0] + (range[1] - range[0]) * k as f64 / 256.)
+                            };
+                            let length = (0..256)
+                                .map(|k| length(std::array::from_fn(|i| at(k + 1)[i] - at(k)[i])))
+                                .sum::<f64>();
+                            // Its curvature is cut span by span below.
+                            (std::array::from_fn(|k| at(256)[k] - at(0)[k]), length, 1.)
+                        }
+                    }
+                };
+                let (da, la, sa) = span(&profile1);
+                let (db, lb, sb) = span(&profile2);
+                // A spline profile adds its own chord parameters, mapped to
+                // the normalized u of the ruling, to the shared grid.
+                for c in [&profile1, &profile2] {
+                    if let Curve::Hermite { range, .. } | Curve::Nurbs { range, .. } = c {
+                        extra.extend(
+                            c.chord_params(CHORD)
+                                .into_iter()
+                                .map(|t| (t - range[0]) / (range[1] - range[0])),
+                        );
+                    }
+                }
                 let mixed = length(std::array::from_fn(|k| da[k] - db[k]));
                 n = n
                     .max((mixed / CHORD).sqrt().ceil())
-                    .max(length(da).ceil())
-                    .max(length(db).ceil());
+                    .max(la.ceil())
+                    .max(lb.ceil())
+                    .max(sa)
+                    .max(sb);
             }
-            (1. / n, 1. / n)
+            ([1. / n, 1. / n], [extra, vec![]])
         }
+        ParametricSurface::HermiteSurf { us, vs, .. } => {
+            // Bicubic patches, cell by cell as for a spline curve: the
+            // second derivative along each direction, sampled through the
+            // cell, splits the cell where it would sag beyond CHORD.
+            let mut parts = [vec![1_usize; us.len() - 1], vec![1_usize; vs.len() - 1]];
+            for j in 0..vs.len() - 1 {
+                for i in 0..us.len() - 1 {
+                    let width = [us[i + 1] - us[i], vs[j + 1] - vs[j]];
+                    let mut bound = [0_f64; 2];
+                    for b in 0..=4 {
+                        for a in 0..=4 {
+                            let u = (us[i] + width[0] * a as f64 / 4.).clamp(min[0], max[0]);
+                            let v = (vs[j] + width[1] * b as f64 / 4.).clamp(min[1], max[1]);
+                            let (uu, vv) = surface.second_derivatives(u, v);
+                            bound[0] = bound[0].max(length(uu));
+                            bound[1] = bound[1].max(length(vv));
+                        }
+                    }
+                    for (k, cell) in [(0, i), (1, j)] {
+                        if bound[k] * width[k] * width[k] / 8. > CHORD {
+                            let n = (width[k] / (8. * CHORD / bound[k]).sqrt()).ceil();
+                            ensure!(n <= 10000., "parametric axis budget exceeded");
+                            parts[k][cell] = parts[k][cell].max(n as usize);
+                        }
+                    }
+                }
+            }
+            let split = |knots: &[f64], parts: &[usize]| {
+                knots
+                    .windows(2)
+                    .zip(parts)
+                    .flat_map(|(w, n)| {
+                        (0..=*n).map(move |k| w[0] + (w[1] - w[0]) * k as f64 / *n as f64)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            (
+                [f64::INFINITY; 2],
+                [split(us, &parts[0]), split(vs, &parts[1])],
+            )
+        }
+    })
+}
+
+/// Trim failures of the rectangular grid that [`trimmed_face`] meshes.
+const NONRECTANGULAR: [&str; 5] = [
+    "nonrectangular parametric trim",
+    "multiple parametric trim loops unsupported",
+    "missing rectangular trim side",
+    "overlapping or incomplete trim perimeter",
+    "incomplete trim perimeter",
+];
+
+/// A face whose UV loops are not one rectangle: a curved wall cut by an
+/// opening or a sloped top. Same surface, steps and orientation as the
+/// rectangular grid; the loops are meshed by
+/// [`crate::native_saved_mesh::trimmed_grid_mesh`].
+fn trimmed_face(g: &ObjectGraph, fi: usize) -> Result<FaceMesh> {
+    let (surface, loops, us, vs) = trimmed_grid(g, fi)?;
+    let f = &g.objects[fi];
+    let flags = f.fields["m_faceFlags_v9"].as_u64().context("face flags")?;
+    let orient = flags & 2 == 0;
+    let surface_orient = surface.orientation();
+    let evaluate = |u: f64, v: f64| -> Result<([f64; 3], [f64; 3])> {
+        let mut n = surface.normal(u, v)?;
+        if !orient {
+            n = n.map(|x| -x);
+        }
+        Ok((surface.evaluate(u, v)?, n))
     };
-    let axis = |k: usize, step: f64| -> Result<Vec<f64>> {
+    let (vertices, normals, triangles) = crate::native_saved_mesh::trimmed_grid_mesh(
+        &loops,
+        &us,
+        &vs,
+        &evaluate,
+        surface_orient == orient,
+        2_000_000,
+    )?;
+    Ok(FaceMesh {
+        face_index: fi,
+        face_tag: f.fields["m_GInfo"]["m_tag"].as_i64().unwrap_or(-1),
+        render_style_id: crate::native_metadata::identifier(&f.fields["m_renderStyleId"])?,
+        normal: normals[0],
+        vertices,
+        normals,
+        triangles,
+        analytic_surface: None,
+        trim_uv: loops.concat(),
+    })
+}
+
+/// Surface and grid knots of a face, rectangular or not: what a planar
+/// neighbour refines its shared edge to.
+pub(crate) fn face_knots(
+    g: &ObjectGraph,
+    fi: usize,
+) -> Result<(ParametricSurface, Vec<f64>, Vec<f64>)> {
+    match face_grid(g, fi) {
+        Ok(grid) => Ok((grid.surface, grid.u, grid.v)),
+        Err(e) if NONRECTANGULAR.contains(&e.to_string().as_str()) => {
+            let (surface, _, us, vs) = trimmed_grid(g, fi)?;
+            Ok((surface, us, vs))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Surface, UV loops and grid knots of a face meshed by [`trimmed_face`].
+#[allow(clippy::type_complexity)]
+fn trimmed_grid(
+    g: &ObjectGraph,
+    fi: usize,
+) -> Result<(ParametricSurface, Vec<Vec<[f64; 2]>>, Vec<f64>, Vec<f64>)> {
+    use crate::native_saved_mesh::pointer;
+    let f = g.objects.get(fi).context("face index")?;
+    let si = pointer(g, fi, &f.fields["m_pSurf"])?.context("face surface")?;
+    let surface = ParametricSurface::read(g, si)?;
+    let env = surface.bounds();
+    // As in the rectangular check: freeform edge ends meet within 1e-4 ft.
+    let meets = |a: [f64; 2], b: [f64; 2]| -> Result<bool> {
+        let clamp =
+            |p: [f64; 2]| std::array::from_fn::<f64, 2, _>(|k| p[k].clamp(env[0][k], env[1][k]));
+        let (a, b) = (clamp(a), clamp(b));
+        Ok(distance(surface.evaluate(a[0], a[1])?, surface.evaluate(b[0], b[1])?) < 1e-4)
+    };
+    let mut loops = crate::native_saved_mesh::face_uv_loops(g, fi, Some(&meets))?;
+    for p in loops.iter_mut().flatten() {
+        for k in 0..2 {
+            ensure!(
+                p[k] >= env[0][k] - 1e-7 && p[k] <= env[1][k] + 1e-7,
+                "trim outside surface envelope"
+            );
+            p[k] = p[k].clamp(env[0][k], env[1][k]);
+        }
+    }
+    let all = || loops.iter().flatten();
+    let min: [f64; 2] = std::array::from_fn(|k| all().map(|p| p[k]).fold(f64::INFINITY, f64::min));
+    let max: [f64; 2] =
+        std::array::from_fn(|k| all().map(|p| p[k]).fold(f64::NEG_INFINITY, f64::max));
+    ensure!(
+        max[0] > min[0] && max[1] > min[1],
+        "degenerate parametric domain"
+    );
+    let ([du, dv], [u_extra, v_extra]) = grid_steps(g, fi, &surface, min, max)?;
+    let axis = |k: usize, step: f64, extra: &[f64]| -> Result<Vec<f64>> {
         let count = ((max[k] - min[k]) / step).ceil().max(1.);
         ensure!(
             count.is_finite() && count <= 10000.,
@@ -355,22 +606,22 @@ pub(crate) fn face_grid(g: &ObjectGraph, fi: usize) -> Result<FaceGrid> {
         let mut a = (0..=count)
             .map(|i| min[k] + (max[k] - min[k]) * i as f64 / count as f64)
             .collect::<Vec<_>>();
-        a.extend(trim.iter().map(|p| p[k]));
+        a.extend(extra.iter().filter(|x| **x > min[k] && **x < max[k]));
+        a.extend(all().map(|p| p[k]));
         a.sort_by(f64::total_cmp);
         a.dedup_by(|a, b| (*a - *b).abs() < 1e-12);
         Ok(a)
     };
-    Ok(FaceGrid {
-        u: axis(0, du)?,
-        v: axis(1, dv)?,
-        surface,
-        trim,
-        bounds: [min, max],
-    })
+    let (us, vs) = (axis(0, du, &u_extra)?, axis(1, dv, &v_extra)?);
+    Ok((surface, loops, us, vs))
 }
 
 pub fn face(g: &ObjectGraph, fi: usize) -> Result<FaceMesh> {
-    let grid = face_grid(g, fi)?;
+    let grid = match face_grid(g, fi) {
+        Ok(grid) => grid,
+        Err(e) if NONRECTANGULAR.contains(&e.to_string().as_str()) => return trimmed_face(g, fi),
+        Err(e) => return Err(e),
+    };
     let f = &g.objects[fi];
     let flags = f.fields["m_faceFlags_v9"].as_u64().context("face flags")?;
     let mesh = tessellate_uv(
@@ -509,11 +760,7 @@ pub fn tessellate_uv(
             .checked_mul(2)
             .ok_or_else(|| anyhow::anyhow!("parametric triangle count overflow"))?,
     );
-    let surface_orient = match surface {
-        ParametricSurface::SurfRev { orient, .. } | ParametricSurface::RuledSurf { orient, .. } => {
-            *orient
-        }
-    };
+    let surface_orient = surface.orientation();
     let winding = surface_orient == orient;
     let stride = u_knots.len();
     for j in 0..v_knots.len() - 1 {
@@ -535,7 +782,8 @@ pub fn tessellate_uv(
                 let p = vertices[x as usize];
                 let q = vertices[y as usize];
                 let d = [q[0] - p[0], q[1] - p[1], q[2] - p[2]];
-                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 1e-20
+                // Freeform poles meet within 1e-6 ft, not exactly.
+                d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= 1e-12
             };
             let add_triangle =
                 |x: u32, y: u32, z: u32, triangles: &mut Vec<[u32; 3]>| -> Result<()> {
