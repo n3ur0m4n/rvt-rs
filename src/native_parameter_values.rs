@@ -205,6 +205,14 @@ const LINE_PEN: i64 = -1006303;
 const TEXT_FONT: i64 = -1006300;
 const TEXT_SIZE: i64 = -1006301;
 const OST_TITLE_BLOCKS: i64 = -2000280;
+/// `ASSEMBLY_CODE` (`UNIFORMAT_CODE` before Revit 2026): the saved code; the
+/// description comes from a table installed with the program, not from the
+/// file, and is not reported.
+const ASSEMBLY_CODE: i64 = -1002500;
+/// `CLASSIFICATION_CODE` (`OMNICLASS_CODE` before Revit 2026).
+const CLASSIFICATION_CODE: i64 = -1002502;
+/// Types that expose the IFC export parameters but no assembly code.
+const NO_ASSEMBLY_CODE_CLASSES: &[&str] = &["GridAttributes", "LevelAttributes"];
 const VIEW_DESCRIPTION: i64 = -1005114;
 /// Text-attribute parameters the API does not list on these type classes
 /// (measured): a spot dimension type and a line-and-text symbol have no pen,
@@ -441,6 +449,8 @@ pub struct Projected {
     gen_level: Option<i64>,
     /// `m_categoryId` and `m_fontId` of the record's `LineAndTextAttr`.
     text_attr_refs: Option<(i64, i64)>,
+    /// The assembly code saved in a family symbol's parameter slots.
+    assembly_code_slot: Option<String>,
 }
 
 /// What other records contribute to a record's values: the class of every
@@ -467,6 +477,8 @@ pub struct Links {
     gstyles: HashMap<i64, (i64, i64)>,
     /// `(m_name, m_size)` of a font element's `Font`.
     fonts: HashMap<i64, (String, f64)>,
+    /// Non-empty `m_omniClassCode` of a `Family`, reported by its symbols too.
+    classification_of_family: HashMap<i64, String>,
 }
 
 impl Links {
@@ -489,6 +501,14 @@ impl Links {
                 }
                 if let Some(name) = root.fields.get("m_name").and_then(Value::as_str) {
                     self.name_of_family.insert(id, name.to_string());
+                }
+                if let Some(code) = root
+                    .fields
+                    .get("m_omniClassCode")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                {
+                    self.classification_of_family.insert(id, code.to_string());
                 }
             }
             "FamilySymbol" => {
@@ -633,6 +653,17 @@ pub fn project(record: &Record) -> Projected {
     let mut detail_curve = false;
     let mut gen_level = None;
     let mut text_attr_refs = None;
+    let assembly_code_slot = record
+        .saved_metadata
+        .as_ref()
+        .and_then(|m| {
+            m.family_parameter_slots
+                .iter()
+                .find(|slot| slot.parameter_id == ASSEMBLY_CODE)
+        })
+        .and_then(|slot| slot.string_slot.as_str())
+        .filter(|code| !code.is_empty())
+        .map(str::to_string);
     if let (Some(graph), Some(root)) = (&record.graph, root) {
         // The text attributes of a type: an object (`m_pLineAndTextAttr`) or
         // an inline struct (`m_lineAndTextAttr`).
@@ -747,6 +778,26 @@ pub fn project(record: &Record) -> Projected {
                 }
             }
             "DBViewDrafting" => saved_fields(root, SHEET_FIELDS, &mut values),
+            // The API lists the classification code on some families and
+            // not on others of the same category: only a saved, non-empty
+            // code is reported.
+            "Family" => {
+                if let Some(code) = root
+                    .fields
+                    .get("m_omniClassCode")
+                    .and_then(Value::as_str)
+                    .filter(|c| !c.is_empty())
+                {
+                    values.entry(CLASSIFICATION_CODE).or_insert_with(|| {
+                        ParameterValue::new(
+                            CLASSIFICATION_CODE,
+                            "String",
+                            Value::from(code),
+                            "saved_field",
+                        )
+                    });
+                }
+            }
             "DBViewPlan" => gen_level = root_identifier(root, "m_genElemId"),
             "Viewport" => {
                 view_id = root_identifier(root, "m_dbViewId");
@@ -822,6 +873,7 @@ pub fn project(record: &Record) -> Projected {
         detail_curve,
         gen_level,
         text_attr_refs,
+        assembly_code_slot,
     }
 }
 
@@ -1193,6 +1245,16 @@ pub fn resolve(p: &mut Projected, links: &Links) {
             set_category(&mut p.values, *category, "resolved");
         }
         if class == "FamilySymbol" {
+            if let Some(code) = links.classification_of_family.get(&family) {
+                p.values.entry(CLASSIFICATION_CODE).or_insert_with(|| {
+                    ParameterValue::new(
+                        CLASSIFICATION_CODE,
+                        "String",
+                        Value::from(code.as_str()),
+                        "resolved",
+                    )
+                });
+            }
             if let Some(name) = links.name_of_family.get(&family) {
                 p.values.entry(ALL_MODEL_FAMILY_NAME).or_insert_with(|| {
                     ParameterValue::new(
@@ -1361,6 +1423,17 @@ fn ifc_export_defaults(p: &mut Projected, family_based: bool) {
     } else {
         (IFC_EXPORT_ELEMENT, IFC_GUID)
     };
+    // The same types list the assembly code (measured): the saved set, the
+    // family slot, else empty.
+    if p.is_type && !NO_ASSEMBLY_CODE_CLASSES.contains(&class) {
+        let (value, source) = match &p.assembly_code_slot {
+            Some(code) => (Value::from(code.as_str()), "family_slot"),
+            None => (Value::from(""), "default_verified"),
+        };
+        p.values
+            .entry(ASSEMBLY_CODE)
+            .or_insert_with(|| ParameterValue::new(ASSEMBLY_CODE, "String", value, source));
+    }
     p.values.entry(flag).or_insert_with(|| {
         ParameterValue::new(flag, "Integer", Value::from(0), "default_verified")
     });
