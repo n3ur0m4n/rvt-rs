@@ -171,19 +171,135 @@ const HIDDEN_LINES_VIEW_CLASSES: &[&str] = &["DBView3d", "DBViewPlan", "DBViewSe
 const VIEW_CLASSES: &[&str] = &[
     "DBView3d",
     "DBViewAnonDrafting",
-    "DBViewDrafting",
     "DBViewLegend",
     "DBViewPlan",
     "DBViewSchedule",
     "DBViewSection",
 ];
-/// Sub-elements whose API parameters are those of their owner
-/// (`Identity.owning_element_id`): `(class, owner class, built-in ids
-/// mirrored, custom parameters mirrored)`. Measured: every listed value equal
-/// to the owner's on every element of the corpus.
-const OWNER_MIRRORS: &[(&str, &str, &[i64], bool)] = &[
+/// Root fields of a sheet (`DBViewDrafting`, the API's `ViewSheet`).
+const SHEET_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_approvedBy", -1007408, "String"),  // SHEET_APPROVED_BY
+    ("m_bScheduled", -1007406, "Integer"), // SHEET_SCHEDULED
+    ("m_checkedBy", -1007405, "String"),   // SHEET_CHECKED_BY
+    ("m_date", -1007403, "String"),        // SHEET_DATE
+    ("m_designedBy", -1007407, "String"),  // SHEET_DESIGNED_BY
+    ("m_drawnBy", -1007404, "String"),     // SHEET_DRAWN_BY
+    ("m_issueDate", -1006322, "String"),   // SHEET_ISSUE_DATE
+    ("m_sheetNumber", -1007401, "String"), // SHEET_NUMBER
+    ("m_viewName", -1007400, "String"),    // SHEET_NAME
+];
+/// Root fields of a viewport.
+const VIEWPORT_FIELDS: &[(&str, i64, &str)] = &[
+    ("m_dbViewId", -1005202, "ElementId"),          // VIEWPORT_VIEW
+    ("m_viewportPositioning", -1005210, "Integer"), // VIEWPORT_POSITIONING
+];
+const VIEWPORT_DETAIL_NUMBER: i64 = -1005201;
+const VIEWPORT_SHEET_NUMBER: i64 = -1005206;
+const VIEWPORT_VIEW_NAME: i64 = -1005203;
+const VIEWER_SHEET_NUMBER: i64 = -1006601;
+const VIEWER_DETAIL_NUMBER: i64 = -1006602;
+const PLAN_VIEW_LEVEL: i64 = -1005166;
+const VIEW_NAME: i64 = -1005112;
+const LINE_COLOR: i64 = -1006304;
+const LINE_PEN: i64 = -1006303;
+const TEXT_FONT: i64 = -1006300;
+const TEXT_SIZE: i64 = -1006301;
+const OST_TITLE_BLOCKS: i64 = -2000280;
+const VIEW_DESCRIPTION: i64 = -1005114;
+/// Text-attribute parameters the API does not list on these type classes
+/// (measured): a spot dimension type and a line-and-text symbol have no pen,
+/// a filled region type only a pen.
+const TEXT_ATTR_EXCLUDED: &[(&str, &[i64])] = &[
+    (
+        "FilledRegionAttributes",
+        &[LINE_COLOR, TEXT_FONT, TEXT_SIZE],
+    ),
+    ("LineAndTextAttrSymbol", &[LINE_PEN]),
+    ("SpotElevationStyle", &[LINE_PEN]),
+];
+/// The view parameters a viewport and a viewer report from their view.
+const VIEW_MIRRORED: &[i64] = &[
+    -1005112, // VIEW_NAME
+    -1005114, // VIEW_DESCRIPTION
+    -1005147, // VIEW_FIXED_SKETCH_PLANE
+    -1005153, // VIEW_UNDERLAY_BOTTOM_ID
+    -1005163, // VIEW_DISCIPLINE
+    -1005168, // PLAN_VIEW_NORTH
+    -1005176, // VIEW_TEMPLATE
+    -1005177, // VIEW_UNDERLAY_ORIENTATION
+    -1005335, // VIEW_UNDERLAY_TOP_ID
+    -1011002, // VIEW_DETAIL_LEVEL
+    -1012102, // VIEW_PHASE
+    -1012103, // VIEW_PHASE_FILTER
+    -1150170, // VIEW_SLANTED_COLUMN_SYMBOL_OFFSET
+    -1154613, // VIEW_SHOW_HIDDEN_LINES
+];
+/// The view parameters a viewer reports from its view: those of a viewport
+/// and the view's type ids.
+const VIEWER_MIRRORED: &[i64] = &[
+    -1002000, -1002050, -1002051,
+    -1002052, // SYMBOL_ID_PARAM, ELEM_TYPE_PARAM, ELEM_FAMILY_PARAM, ELEM_FAMILY_AND_TYPE_PARAM
+    -1005112, -1005114, -1005147, -1005153, -1005163, -1005168, -1005176, -1005177, -1005335,
+    -1011002, -1012102, -1012103, -1150170, -1154613,
+];
+/// The sheet parameters a title block reports from its sheet.
+const SHEET_MIRRORED: &[i64] = &[
+    -1006322, -1007400, -1007401, -1007403, -1007404, -1007405, -1007407, -1007408,
+];
+
+/// Which record a mirrored parameter comes from.
+#[derive(Debug, Clone, Copy)]
+enum MirrorSource {
+    /// `Identity.owning_element_id`.
+    Owner,
+    /// The root's `m_ownerDBViewId` (the sheet of a title block).
+    OwnerView,
+    /// The root's `m_dbViewId` (the view of a viewport or viewer).
+    View,
+}
+/// Elements whose API parameters are those of another record: `(class,
+/// category or None, source, source class or "DBView*" for any view,
+/// built-in ids mirrored, custom parameters mirrored)`. Measured: every
+/// listed value equal to the source's on every element of the corpus.
+/// `(class, category or None, source, source class or "DBView*", built-in
+/// ids mirrored, custom parameters mirrored)`.
+type Mirror = (
+    &'static str,
+    Option<i64>,
+    MirrorSource,
+    &'static str,
+    &'static [i64],
+    bool,
+);
+const MIRRORS: &[Mirror] = &[
+    (
+        "FamilyInstance",
+        Some(OST_TITLE_BLOCKS),
+        MirrorSource::OwnerView,
+        "DBViewDrafting",
+        SHEET_MIRRORED,
+        false,
+    ),
+    (
+        "Viewport",
+        None,
+        MirrorSource::View,
+        "DBView*",
+        VIEW_MIRRORED,
+        false,
+    ),
+    (
+        "Viewer",
+        None,
+        MirrorSource::View,
+        "DBView*",
+        VIEWER_MIRRORED,
+        false,
+    ),
     (
         "PipeFittingCenterLine",
+        None,
+        MirrorSource::Owner,
         "FamilyInstance",
         &[
             -1001352, // FAMILY_LEVEL_PARAM
@@ -196,6 +312,8 @@ const OWNER_MIRRORS: &[(&str, &str, &[i64], bool)] = &[
     ),
     (
         "SegmentCenterLine",
+        None,
+        MirrorSource::Owner,
         "RbsPipeCurve",
         &[
             -1012100, // PHASE_CREATED
@@ -315,8 +433,14 @@ pub struct Projected {
     view_id: Option<i64>,
     /// The element this one belongs to (`Identity.owning_element_id`).
     owner: Option<u64>,
+    /// The root's `m_ownerDBViewId` (a sheet for a title block or viewport).
+    owner_view: Option<u64>,
     /// A `CurveElem` saved as a detail curve (`m_detail`).
     detail_curve: bool,
+    /// `m_genElemId` of a plan view: its level.
+    gen_level: Option<i64>,
+    /// `m_categoryId` and `m_fontId` of the record's `LineAndTextAttr`.
+    text_attr_refs: Option<(i64, i64)>,
 }
 
 /// What other records contribute to a record's values: the class of every
@@ -331,6 +455,18 @@ pub struct Links {
     footing_type_of_floor_type: HashMap<i64, i64>,
     /// `m_dimensionStyleType` of a `SpotElevationStyle`: 4 elevation, 8 slope.
     spot_style_kind: HashMap<i64, i64>,
+    /// `m_text` of a `Level`.
+    level_names: HashMap<i64, String>,
+    /// `m_sheetNumber` of a sheet (`DBViewDrafting`).
+    sheet_numbers: HashMap<u64, String>,
+    /// For each view, its viewports as `(sheet, detail number)`.
+    placements: HashMap<u64, Vec<(u64, String)>>,
+    /// The first graphics style of a category element (`m_gstyleIds`).
+    gstyle_of_category: HashMap<i64, i64>,
+    /// `(m_color, m_penNumber)` of a graphics style element's `GStyle`.
+    gstyles: HashMap<i64, (i64, i64)>,
+    /// `(m_name, m_size)` of a font element's `Font`.
+    fonts: HashMap<i64, (String, f64)>,
 }
 
 impl Links {
@@ -372,6 +508,69 @@ impl Links {
                     .and_then(Value::as_i64)
                 {
                     self.spot_style_kind.insert(id, kind);
+                }
+            }
+            "Level" => {
+                if let Some(text) = root.fields.get("m_text").and_then(Value::as_str) {
+                    self.level_names.insert(id, text.to_string());
+                }
+            }
+            "DBViewDrafting" => {
+                if let Some(number) = root.fields.get("m_sheetNumber").and_then(Value::as_str) {
+                    self.sheet_numbers
+                        .insert(record.identity.element_id, number.to_string());
+                }
+            }
+            "Viewport" => {
+                let view = root_identifier(root, "m_dbViewId").and_then(|v| u64::try_from(v).ok());
+                let sheet =
+                    root_identifier(root, "m_ownerDBViewId").and_then(|v| u64::try_from(v).ok());
+                let detail = root
+                    .fields
+                    .get("m_detailNumber")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if let (Some(view), Some(sheet)) = (view, sheet) {
+                    self.placements
+                        .entry(view)
+                        .or_default()
+                        .push((sheet, detail));
+                }
+            }
+            "CategoryElem" => {
+                if let Some(style) = root
+                    .fields
+                    .get("m_gstyleIds")
+                    .and_then(Value::as_array)
+                    .and_then(|ids| ids.first())
+                    .and_then(|v| identifier(v).ok())
+                {
+                    self.gstyle_of_category.insert(id, style);
+                }
+            }
+            "GStyleElem" => {
+                if let Some(style) = record
+                    .graph
+                    .as_ref()
+                    .and_then(|g| unique_object(g, "GStyle"))
+                {
+                    if let (Some(color), Some(pen)) = (
+                        style.fields.get("m_color").and_then(Value::as_i64),
+                        style.fields.get("m_penNumber").and_then(Value::as_i64),
+                    ) {
+                        self.gstyles.insert(id, (color, pen));
+                    }
+                }
+            }
+            "FontElem" => {
+                if let Some(font) = record.graph.as_ref().and_then(|g| unique_object(g, "Font")) {
+                    if let (Some(name), Some(size)) = (
+                        font.fields.get("m_name").and_then(Value::as_str),
+                        font.fields.get("m_size").and_then(Value::as_f64),
+                    ) {
+                        self.fonts.insert(id, (name.to_string(), size));
+                    }
                 }
             }
             _ => {}
@@ -432,7 +631,24 @@ pub fn project(record: &Record) -> Projected {
     let mut family_id = None;
     let mut view_id = None;
     let mut detail_curve = false;
+    let mut gen_level = None;
+    let mut text_attr_refs = None;
     if let (Some(graph), Some(root)) = (&record.graph, root) {
+        // The text attributes of a type: an object (`m_pLineAndTextAttr`) or
+        // an inline struct (`m_lineAndTextAttr`).
+        let attributes = root
+            .fields
+            .get("m_pLineAndTextAttr")
+            .and_then(|pointer| pointer_target(graph, 0, pointer))
+            .filter(|o| o.class_name == "LineAndTextAttr")
+            .map(|o| &o.fields)
+            .or_else(|| root.fields.get("m_lineAndTextAttr"));
+        if let Some(attributes) = attributes {
+            text_attr_refs = attributes
+                .get("m_categoryId")
+                .and_then(|v| identifier(v).ok())
+                .zip(attributes.get("m_fontId").and_then(|v| identifier(v).ok()));
+        }
         parameter_store(class, graph, root, &mut values);
         type_id(class, graph, root, &mut values);
         if is_type {
@@ -530,6 +746,28 @@ pub fn project(record: &Record) -> Projected {
                     set_category(&mut values, category, "saved_field");
                 }
             }
+            "DBViewDrafting" => saved_fields(root, SHEET_FIELDS, &mut values),
+            "DBViewPlan" => gen_level = root_identifier(root, "m_genElemId"),
+            "Viewport" => {
+                view_id = root_identifier(root, "m_dbViewId");
+                saved_fields(root, VIEWPORT_FIELDS, &mut values);
+                // The detail number is listed only once set.
+                if let Some(detail) = root
+                    .fields
+                    .get("m_detailNumber")
+                    .and_then(Value::as_str)
+                    .filter(|d| !d.is_empty())
+                {
+                    values.entry(VIEWPORT_DETAIL_NUMBER).or_insert_with(|| {
+                        ParameterValue::new(
+                            VIEWPORT_DETAIL_NUMBER,
+                            "String",
+                            Value::from(detail),
+                            "saved_field",
+                        )
+                    });
+                }
+            }
             "CurveElem" => {
                 if unique_object(graph, "RepeatingDetailUserData").is_some() {
                     set_category(&mut values, OST_DETAIL_COMPONENTS, "saved_field");
@@ -578,7 +816,12 @@ pub fn project(record: &Record) -> Projected {
         family_id,
         view_id,
         owner: u64::try_from(record.identity.owning_element_id).ok(),
+        owner_view: root
+            .and_then(|root| root_identifier(root, "m_ownerDBViewId"))
+            .and_then(|v| u64::try_from(v).ok()),
         detail_curve,
+        gen_level,
+        text_attr_refs,
     }
 }
 
@@ -995,6 +1238,89 @@ pub fn resolve(p: &mut Projected, links: &Links) {
             _ => {}
         }
     }
+    // A view reports the sheet and detail number of its one placement; a
+    // legend, placeable on many sheets, reports no sheet; nothing placed
+    // reports "---" and "-" (measured on every view of the corpus).
+    if VIEW_CLASSES.contains(&class) && p.values.contains_key(&VIEW_NAME) {
+        let placements = links.placements.get(&p.element_id);
+        let one = placements.filter(|v| v.len() == 1).and_then(|v| v.first());
+        let sheet = match one {
+            Some((sheet, _)) if class != "DBViewLegend" => {
+                links.sheet_numbers.get(sheet).map(String::as_str)
+            }
+            _ => None,
+        };
+        let detail = one.map(|(_, d)| d.as_str()).filter(|d| !d.is_empty());
+        for (id, value, empty) in [
+            (VIEWER_SHEET_NUMBER, sheet, "---"),
+            (VIEWER_DETAIL_NUMBER, detail, "-"),
+        ] {
+            p.values.entry(id).or_insert_with(|| {
+                ParameterValue::new(
+                    id,
+                    "String",
+                    Value::from(value.unwrap_or(empty)),
+                    "resolved",
+                )
+            });
+        }
+    }
+    if let Some(level) = p.gen_level.and_then(|l| links.level_names.get(&l)) {
+        if p.values.contains_key(&VIEW_NAME) {
+            p.values.entry(PLAN_VIEW_LEVEL).or_insert_with(|| {
+                ParameterValue::new(
+                    PLAN_VIEW_LEVEL,
+                    "String",
+                    Value::from(level.as_str()),
+                    "resolved",
+                )
+            });
+        }
+    }
+    // A viewport on a sheet reports the sheet number.
+    if class == "Viewport" {
+        if let Some(number) = p
+            .owner_view
+            .and_then(|sheet| links.sheet_numbers.get(&sheet))
+        {
+            p.values.entry(VIEWPORT_SHEET_NUMBER).or_insert_with(|| {
+                ParameterValue::new(
+                    VIEWPORT_SHEET_NUMBER,
+                    "String",
+                    Value::from(number.as_str()),
+                    "resolved",
+                )
+            });
+        }
+    }
+    // A type's line color and pen are those of its subcategory's graphics
+    // style, its font name and size those of its font element.
+    if let Some((category, font)) = p.text_attr_refs {
+        let excluded = TEXT_ATTR_EXCLUDED
+            .iter()
+            .find(|(c, _)| *c == class)
+            .map_or(&[][..], |(_, ids)| *ids);
+        let mut attributes = Vec::new();
+        if let Some((color, pen)) = links
+            .gstyle_of_category
+            .get(&category)
+            .and_then(|style| links.gstyles.get(style))
+        {
+            attributes.push((LINE_COLOR, "Integer", Value::from(*color)));
+            attributes.push((LINE_PEN, "Integer", Value::from(*pen)));
+        }
+        if let Some((name, size)) = links.fonts.get(&font) {
+            attributes.push((TEXT_FONT, "String", Value::from(name.as_str())));
+            attributes.push((TEXT_SIZE, "Double", Value::from(*size)));
+        }
+        for (id, storage, value) in attributes {
+            if !excluded.contains(&id) {
+                p.values
+                    .entry(id)
+                    .or_insert_with(|| ParameterValue::new(id, storage, value, "resolved"));
+            }
+        }
+    }
     // A viewer (section mark, elevation arrow, camera) reports its view's category.
     if let Some(category) = p
         .view_id
@@ -1058,9 +1384,11 @@ fn ifc_export_defaults(p: &mut Projected, family_based: bool) {
     }
 }
 
-/// Third pass: a sub-element listed in [`OWNER_MIRRORS`] reports its owner's
-/// values for the parameters the API mirrors, once every record is resolved.
-/// A value the sub-element already has (other than a withheld one) stays.
+/// Third pass: an element listed in [`MIRRORS`] reports the values of its
+/// source record (owner, sheet or view) for the parameters the API mirrors,
+/// once every record is resolved. A value the element already has (other
+/// than a withheld one) stays. A viewport also reports its view's name as
+/// `VIEWPORT_VIEW_NAME`.
 pub fn mirror_owners(projected: &mut [Projected]) {
     let index: HashMap<u64, usize> = projected
         .iter()
@@ -1069,21 +1397,36 @@ pub fn mirror_owners(projected: &mut [Projected]) {
         .collect();
     for i in 0..projected.len() {
         let class = projected[i].class_name.as_deref().unwrap_or("");
-        let Some(&(_, owner_class, builtins, custom)) =
-            OWNER_MIRRORS.iter().find(|(c, _, _, _)| *c == class)
+        let category = projected[i]
+            .values
+            .get(&ELEM_CATEGORY_PARAM)
+            .and_then(|v| v.value.as_ref())
+            .and_then(Value::as_i64);
+        let Some(&(_, _, source, source_class, builtins, custom)) =
+            MIRRORS.iter().find(|(c, cat, _, _, _, _)| {
+                *c == class && cat.is_none_or(|cat| Some(cat) == category)
+            })
         else {
             continue;
         };
-        let Some(owner) = projected[i]
-            .owner
-            .and_then(|owner| index.get(&owner).copied())
-        else {
+        let source_id = match source {
+            MirrorSource::Owner => projected[i].owner,
+            MirrorSource::OwnerView => projected[i].owner_view,
+            MirrorSource::View => projected[i].view_id.and_then(|v| u64::try_from(v).ok()),
+        };
+        let Some(src) = source_id.and_then(|id| index.get(&id).copied()) else {
             continue;
         };
-        if projected[owner].class_name.as_deref() != Some(owner_class) {
+        let src_class = projected[src].class_name.as_deref().unwrap_or("");
+        let class_matches = if source_class == "DBView*" {
+            src_class.starts_with("DBView") && src_class != "DBViewDrafting"
+        } else {
+            src_class == source_class
+        };
+        if !class_matches {
             continue;
         }
-        let mirrored: Vec<ParameterValue> = projected[owner]
+        let mut mirrored: Vec<ParameterValue> = projected[src]
             .values
             .values()
             .filter(|v| v.value.is_some())
@@ -1096,6 +1439,26 @@ pub fn mirror_owners(projected: &mut [Projected]) {
                 diagnostic: None,
             })
             .collect();
+        // The viewport's view name is the view's title on sheet (its
+        // description) when set, else its name.
+        if class == "Viewport" {
+            let text = |id: i64| {
+                projected[src]
+                    .values
+                    .get(&id)
+                    .and_then(|v| v.value.as_ref())
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+            };
+            if let Some(name) = text(VIEW_DESCRIPTION).or_else(|| text(VIEW_NAME)) {
+                mirrored.push(ParameterValue::new(
+                    VIEWPORT_VIEW_NAME,
+                    "String",
+                    Value::from(name),
+                    "owner",
+                ));
+            }
+        }
         let values = &mut projected[i].values;
         for v in mirrored {
             match values.get(&v.parameter_id) {
