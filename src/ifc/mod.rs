@@ -868,7 +868,26 @@ impl RvtDocExporter {
         quality_mode: ExportQualityMode,
         limits: crate::walker::WalkerLimits,
     ) -> Result<IfcModel> {
-        export_rvt_doc(rf, RvtDocExportMode::Default, quality_mode, limits)
+        self.export_with_mode_limits_and_control(
+            rf,
+            quality_mode,
+            limits,
+            &crate::control::WalkerControl::default(),
+        )
+    }
+
+    /// Same as [`Self::export_with_mode_and_limits`], walking the elements
+    /// through [`crate::walker::iter_elements_with_control`]: `control`
+    /// receives the walk's progress, and a cancelled token stops the export
+    /// with [`crate::Error::Cancelled`].
+    pub fn export_with_mode_limits_and_control(
+        &self,
+        rf: &mut crate::RevitFile,
+        quality_mode: ExportQualityMode,
+        limits: crate::walker::WalkerLimits,
+        control: &crate::control::WalkerControl,
+    ) -> Result<IfcModel> {
+        export_rvt_doc(rf, RvtDocExportMode::Default, quality_mode, limits, control)
     }
 
     pub fn export_with_diagnostics(&self, rf: &mut crate::RevitFile) -> Result<ExportResult> {
@@ -928,6 +947,7 @@ impl DiagnosticRvtDocExporter {
             RvtDocExportMode::DiagnosticProxies,
             ExportQualityMode::Scaffold,
             limits,
+            &crate::control::WalkerControl::default(),
         )
     }
 
@@ -983,6 +1003,7 @@ fn export_rvt_doc(
     mode: RvtDocExportMode,
     quality_mode: ExportQualityMode,
     walker_limits: crate::walker::WalkerLimits,
+    control: &crate::control::WalkerControl,
 ) -> Result<IfcModel> {
     let policy = export_content::ExportContentPolicy::for_quality_mode(quality_mode);
     // Identity from PartAtom if present; fall back to the file name in
@@ -1072,7 +1093,8 @@ fn export_rvt_doc(
         &mut materials,
         policy,
         walker_limits,
-    );
+        control,
+    )?;
     if mode == RvtDocExportMode::DiagnosticProxies {
         append_diagnostic_walker_proxy_candidates(rf, &mut entities, walker_limits);
     }
@@ -2825,12 +2847,19 @@ fn append_production_walker_elements(
     materials: &mut Vec<MaterialInfo>,
     policy: export_content::ExportContentPolicy,
     walker_limits: crate::walker::WalkerLimits,
-) -> WalkerElementData {
-    if let Ok(decoded_iter) = crate::walker::iter_elements_with_limits(
+    control: &crate::control::WalkerControl,
+) -> Result<WalkerElementData> {
+    // A failed walk leaves the metadata-only model; a cancelled one stops.
+    let walk = crate::walker::iter_elements_with_control(
         rf,
         crate::walker::PRODUCTION_ELEMENT_MIN_SCORE,
         walker_limits,
-    ) {
+        control,
+    );
+    if let Err(crate::Error::Cancelled) = walk {
+        return Err(crate::Error::Cancelled);
+    }
+    if let Ok(decoded_iter) = walk {
         // M3-07: hide low-confidence rows from default IFC emission.
         let filtered = decoded_iter
             .filter(|e| e.meets_confidence(crate::walker::DEFAULT_MIN_ELEMENT_CONFIDENCE));
@@ -2841,7 +2870,7 @@ fn append_production_walker_elements(
             policy,
         );
         materials.extend(append.materials);
-        return (
+        return Ok((
             append.element_layers,
             append.element_type_materials,
             append.unplaced_wall_layers,
@@ -2850,9 +2879,9 @@ fn append_production_walker_elements(
             append.element_flips,
             append.computed_inverts,
             append.body_pieces,
-        );
+        ));
     }
-    Default::default()
+    Ok(Default::default())
 }
 
 fn append_diagnostic_walker_proxy_candidates(
