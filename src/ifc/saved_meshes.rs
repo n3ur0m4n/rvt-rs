@@ -189,13 +189,34 @@ pub fn attach_all(
     rf: &mut crate::RevitFile,
     model: &mut IfcModel,
 ) -> anyhow::Result<SavedSceneReport> {
-    let mut report = SavedSceneReport::default();
-    let options = crate::native_document::Options {
+    let scene = saved_scene(rf)?;
+    attach_scene(rf, model, scene)
+}
+
+fn scene_options() -> crate::native_document::Options {
+    crate::native_document::Options {
         max_graph_values: 1_000_000,
         max_graph_objects: 1_000_000,
         ..Default::default()
-    };
-    let scene = crate::native_saved_scene::extract_at_detail(rf, &options, 3)?;
+    }
+}
+
+/// The saved meshes [`attach_all`] draws, read on their own: a caller can
+/// read them from a second handle while it exports the model.
+pub fn saved_scene(
+    rf: &mut crate::RevitFile,
+) -> anyhow::Result<crate::native_saved_scene::SavedScene> {
+    crate::native_saved_scene::extract_at_detail(rf, &scene_options(), 3)
+}
+
+/// [`attach_all`] with the scene already read by [`saved_scene`].
+pub fn attach_scene(
+    rf: &mut crate::RevitFile,
+    model: &mut IfcModel,
+    scene: crate::native_saved_scene::SavedScene,
+) -> anyhow::Result<SavedSceneReport> {
+    let mut report = SavedSceneReport::default();
+    let options = scene_options();
     let with_mesh: Vec<_> = scene
         .elements
         .iter()
@@ -213,7 +234,7 @@ pub fn attach_all(
         }
         let mut opts = options.clone();
         opts.selected_ids = wanted.clone();
-        crate::native_document::extract(rf, &opts, |r| {
+        crate::native_document::extract_graphs(rf, &opts, |r| {
             owner.insert(r.identity.element_id, r.identity.owning_element_id);
             if let Some(c) = &r.class_name {
                 class.insert(r.identity.element_id, c.clone());
@@ -336,6 +357,8 @@ pub fn attach_all(
             }
         }
     }
+    // Freeing the decoded graphs takes seconds on large models: do it aside.
+    std::thread::spawn(move || drop(scene));
     Ok(report)
 }
 

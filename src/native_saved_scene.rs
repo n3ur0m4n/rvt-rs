@@ -55,13 +55,14 @@ pub fn extract_at_detail(
     let mut opts = options.clone();
     opts.channels = BTreeSet::from([103]);
     let mut records = BTreeMap::<u64, Record>::new();
-    let first = native_document::extract(file, &opts, |r| {
+    let first = native_document::extract_graphs(file, &opts, |r| {
         ensure!(
             records.insert(r.identity.element_id, r).is_none(),
             "duplicate current graphics owner"
         );
         Ok(())
     })?;
+    crate::progress::report("saved graphics", 1, 1);
     let roots: BTreeSet<_> = records.keys().copied().collect();
     let mut summaries = vec![first];
     let mut attempted = roots.clone();
@@ -91,7 +92,7 @@ pub fn extract_at_detail(
         ensure!(depth < 128, "shared graphics closure depth budget");
         attempted.extend(&wanted);
         opts.selected_ids = wanted;
-        summaries.push(native_document::extract(file, &opts, |r| {
+        summaries.push(native_document::extract_graphs(file, &opts, |r| {
             ensure!(
                 records.insert(r.identity.element_id, r).is_none(),
                 "duplicate shared graphics owner"
@@ -103,11 +104,15 @@ pub fn extract_at_detail(
     let mut material_options = options.clone();
     material_options.channels = BTreeSet::from([102]);
     material_options.selected_ids.clear();
-    summaries.push(native_document::extract(file, &material_options, |r| {
-        resolver.ingest(&r)
-    })?);
-    let mut elements = Vec::new();
-    for id in roots {
+    summaries.push(native_document::extract_graphs(
+        file,
+        &material_options,
+        |r| resolver.ingest(&r),
+    )?);
+    crate::progress::report("saved materials", 1, 1);
+    // Elements mesh independently: spread them over the cores, keeping order.
+    let roots: Vec<u64> = roots.into_iter().collect();
+    let build = |id: u64| -> Result<SavedElement> {
         let r = &records[&id];
         let mut meshes = match &r.graph {
             Some(g) => native_saved_mesh::graphics_with_resolver_at_detail(
@@ -149,7 +154,7 @@ pub fn extract_at_detail(
                 None => unresolved_material_primitives.push(index),
             }
         }
-        elements.push(SavedElement {
+        Ok(SavedElement {
             render_materials,
             unresolved_material_primitives,
             id,
@@ -158,8 +163,39 @@ pub fn extract_at_detail(
             referenced_graph_sources,
             status: saved_element_status(&meshes).into(),
             meshes,
-        });
-    }
+        })
+    };
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done = std::sync::atomic::AtomicUsize::new(0);
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let mut built: Vec<(usize, Result<SavedElement>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut out = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&id) = roots.get(i) else { break };
+                        out.push((i, build(id)));
+                        let finished = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                        crate::progress::report("saved meshes", finished, roots.len());
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("saved mesh worker panicked"))
+            .collect()
+    });
+    built.sort_by_key(|(i, _)| *i);
+    let elements = built
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect::<Result<Vec<_>>>()?;
+    // Freeing the decoded graphs takes seconds on large models: do it aside.
+    std::thread::spawn(move || drop(records));
     Ok(SavedScene {
         source_sha256: None,
         format: "rvt-native-saved-scene-v1",

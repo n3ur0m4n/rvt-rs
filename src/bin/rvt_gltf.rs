@@ -61,6 +61,11 @@ struct Cli {
     /// there is no saved mesh. Implies --saved-meshes.
     #[arg(long)]
     saved_first: bool,
+
+    /// Print `progress N` lines (percent done) to stderr as the conversion
+    /// goes, for front ends that show a progress bar.
+    #[arg(long)]
+    progress: bool,
 }
 
 fn main() -> ExitCode {
@@ -103,13 +108,33 @@ fn run(cli: &Cli) -> Result<(), String> {
         cli.output.as_deref(),
         "glb",
     )?;
+    let progress = Progress::new(cli.progress);
     // Open errors from the library already name the file.
     let mut rf = RevitFile::open(&input).map_err(|e| e.to_string())?;
+    // The saved meshes do not depend on the export: read them from a second
+    // handle meanwhile.
+    let scene = cli.saved_first.then(|| {
+        let input = input.clone();
+        std::thread::spawn(move || -> anyhow::Result<_> {
+            let mut rf = RevitFile::open(&input)?;
+            rvt::ifc::saved_meshes::saved_scene(&mut rf)
+        })
+    });
     let mut model = RvtDocExporter
         .export(&mut rf)
         .map_err(|e| format!("export {}: {e}", input.display()))?;
-    if cli.saved_first {
-        match rvt::ifc::saved_meshes::attach_all(&mut rf, &mut model) {
+    progress.stage("export", 1, 1);
+    if !cli.saved_first {
+        for (stage, _) in &STAGES[..3] {
+            progress.stage(stage, 1, 1);
+        }
+    }
+    if let Some(scene) = scene {
+        let attached = scene
+            .join()
+            .map_err(|_| "saved graphics reader panicked".to_string())?
+            .and_then(|scene| rvt::ifc::saved_meshes::attach_scene(&mut rf, &mut model, scene));
+        match attached {
             Ok(report) if cli.verbose => println!(
                 "rvt-gltf: saved meshes: {} drawable, {} replaced, {} added, {} ambiguous",
                 report.drawable, report.replaced, report.added, report.ambiguous
@@ -122,8 +147,10 @@ fn run(cli: &Cli) -> Result<(), String> {
             eprintln!("rvt-gltf: saved graphics not read, bodies unchanged: {e}");
         }
     }
+    progress.stage("attach", 1, 1);
     let glb = model_to_glb(&model);
     fs::write(&output, &glb).map_err(|e| format!("write {}: {e}", output.display()))?;
+    progress.stage("write", 1, 1);
     if cli.verbose {
         println!(
             "rvt-gltf: wrote {} bytes ({} building elements) to {}",
@@ -137,4 +164,58 @@ fn run(cli: &Cli) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+/// Overall percent from the stages' own progress. A stage's share is its
+/// typical part of the conversion time on large models (2026-10-21); within a
+/// stage the percent follows its counted work. The export runs alongside the
+/// saved-mesh stages and only holds the end when it is slower.
+#[derive(Clone)]
+struct Progress {
+    /// Last percent printed and each stage's done fraction.
+    shown: Option<std::sync::Arc<std::sync::Mutex<Shown>>>,
+}
+
+type Shown = (usize, [f64; STAGES.len()]);
+
+const STAGES: [(&str, f64); 6] = [
+    ("saved graphics", 25.),
+    ("saved materials", 15.),
+    ("saved meshes", 45.),
+    ("export", 5.),
+    ("attach", 8.),
+    ("write", 2.),
+];
+
+impl Progress {
+    fn new(enabled: bool) -> Self {
+        let progress = Self {
+            shown: enabled.then(Default::default),
+        };
+        if enabled {
+            let sink = progress.clone();
+            rvt::progress::set_sink(move |stage, done, total| sink.stage(stage, done, total));
+            eprintln!("progress 0");
+        }
+        progress
+    }
+
+    fn stage(&self, stage: &str, done: usize, total: usize) {
+        let Some(shown) = &self.shown else { return };
+        let Some(k) = STAGES.iter().position(|(name, _)| *name == stage) else {
+            return;
+        };
+        let mut shown = shown.lock().unwrap_or_else(|e| e.into_inner());
+        shown.1[k] = shown.1[k].max(done as f64 / total.max(1) as f64);
+        let percent = STAGES
+            .iter()
+            .zip(shown.1)
+            .map(|((_, share), fraction)| share * fraction)
+            .sum::<f64>()
+            .floor() as usize;
+        if percent > shown.0 {
+            shown.0 = percent;
+            eprintln!("progress {percent}");
+        }
+    }
 }

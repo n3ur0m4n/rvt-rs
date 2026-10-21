@@ -43,28 +43,24 @@ impl Default for CylinderTessellationProfile {
         }
     }
 }
+type SurfaceEval = std::rc::Rc<dyn Fn([f64; 2]) -> Result<[f64; 3]>>;
+/// Grid knots and evaluator of a curved face, as its neighbours refine
+/// their shared edges against it.
+type NeighbourGrid = std::rc::Rc<(Vec<f64>, Vec<f64>, SurfaceEval)>;
+/// Pointer resolution over a graph's lookup tables, built once per graph.
 struct PointerIndex<'a> {
     graph: &'a ObjectGraph,
-    edges: BTreeMap<(usize, usize), Vec<usize>>,
-    tokens: BTreeMap<u64, Vec<usize>>,
+    lookup: &'a crate::native_parameters::PointerLookup,
+    /// Curved-face grids by face index: a plane face meets the same curved
+    /// face along many edges.
+    grids: std::cell::RefCell<BTreeMap<usize, NeighbourGrid>>,
 }
 impl<'a> PointerIndex<'a> {
     fn new(graph: &'a ObjectGraph) -> Self {
-        let mut edges: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        let mut tokens: BTreeMap<_, Vec<_>> = BTreeMap::new();
-        for (i, e) in graph.edges.iter().enumerate() {
-            edges
-                .entry((e.source_object_index, e.pointer_offset))
-                .or_default()
-                .push(i);
-        }
-        for (i, o) in graph.objects.iter().enumerate() {
-            tokens.entry(o.token as u64).or_default().push(i);
-        }
         Self {
             graph,
-            edges,
-            tokens,
+            lookup: graph.lookup(),
+            grids: Default::default(),
         }
     }
     fn resolve(&self, source: usize, v: &Value) -> Result<Option<usize>> {
@@ -77,6 +73,7 @@ impl<'a> PointerIndex<'a> {
         }
         let off = v["offset"].as_u64().context("pointer offset")? as usize;
         let edges = self
+            .lookup
             .edges
             .get(&(source, off))
             .map(Vec::as_slice)
@@ -101,52 +98,13 @@ impl<'a> PointerIndex<'a> {
         }
         ensure!(edges.is_empty(), "ambiguous pointer edge");
         ensure!(t != u32::MAX as u64, "unresolved anonymous pointer");
-        let objs = self.tokens.get(&t).map(Vec::as_slice).unwrap_or(&[]);
+        let objs = self.lookup.tokens.get(&t).map(Vec::as_slice).unwrap_or(&[]);
         ensure!(objs.len() == 1, "unresolved or ambiguous token {t}");
         Ok(Some(objs[0]))
     }
 }
 pub fn pointer(g: &ObjectGraph, source: usize, v: &Value) -> Result<Option<usize>> {
-    let t = v["pointer_token"]
-        .as_u64()
-        .context("missing pointer token")?;
-    if t == 0 {
-        return Ok(None);
-    }
-    let off = v["offset"].as_u64().context("pointer offset")? as usize;
-    let edges: Vec<_> = g
-        .edges
-        .iter()
-        .filter(|e| e.source_object_index == source && e.pointer_offset == off)
-        .collect();
-    if edges.len() == 1 {
-        let e = edges[0];
-        let target = g
-            .objects
-            .get(e.target_object_index)
-            .context("pointer target out of bounds")?;
-        ensure!(
-            e.pointer_token as u64 == t && target.class_tag == e.target_class_tag,
-            "pointer edge metadata mismatch"
-        );
-        if let Some(tag) = v["class_tag"].as_u64() {
-            ensure!(
-                tag == target.class_tag as u64,
-                "pointer target class mismatch"
-            )
-        }
-        return Ok(Some(e.target_object_index));
-    }
-    ensure!(edges.is_empty(), "ambiguous pointer edge");
-    ensure!(t != u32::MAX as u64, "unresolved anonymous pointer");
-    let objs: Vec<_> = g
-        .objects
-        .iter()
-        .enumerate()
-        .filter(|(_, o)| o.token as u64 == t)
-        .collect();
-    ensure!(objs.len() == 1, "unresolved or ambiguous token {t}");
-    Ok(Some(objs[0].0))
+    PointerIndex::new(g).resolve(source, v)
 }
 fn point<const N: usize>(v: &Value) -> Result<[f64; N]> {
     let a = v.as_array().context("point array")?;
@@ -257,55 +215,66 @@ fn refined_plane_edge(
     if !matches!(kind, "CylSurf" | "SurfRev" | "RuledSurf" | "HermiteSurf") {
         return Ok(original);
     }
-    type SurfaceEval = Box<dyn Fn([f64; 2]) -> Result<[f64; 3]>>;
-    let (u_values, v_values, evaluate): (Vec<f64>, Vec<f64>, SurfaceEval) = if kind == "CylSurf" {
-        let profile = CylinderTessellationProfile::default();
-        let mesh = cylinder_face(g, other, profile)?;
-        let cylinder = mesh
-            .analytic_surface
-            .context("cylinder analytic metadata missing")?;
-        let min: [f64; 2] = std::array::from_fn(|k| {
-            mesh.trim_uv
-                .iter()
-                .map(|p| p[k])
-                .fold(f64::INFINITY, f64::min)
-        });
-        let max: [f64; 2] = std::array::from_fn(|k| {
-            mesh.trim_uv
-                .iter()
-                .map(|p| p[k])
-                .fold(f64::NEG_INFINITY, f64::max)
-        });
-        let step = (4.
-            * (profile.chord_error / (2. * cylinder.radius))
-                .min(1.)
-                .sqrt()
-                .asin())
-        .min(std::f64::consts::FRAC_PI_2);
-        let us = tessellation_axis(min[0], max[0], step, mesh.trim_uv.iter().map(|p| p[0]))?;
-        let vs = tessellation_axis(
-            min[1],
-            max[1],
-            profile.max_v_edge,
-            mesh.trim_uv.iter().map(|p| p[1]),
-        )?;
-        let eval = Box::new(move |uv: [f64; 2]| {
-            let (sn, cs) = uv[0].sin_cos();
-            Ok(std::array::from_fn(|k| {
-                cylinder.center[k]
-                    + cylinder.radius * (cs * cylinder.x_vec[k] + sn * cylinder.y_vec[k])
-                    + uv[1] * cylinder.z_vec[k]
-            }))
-        });
-        (us, vs, eval)
-    } else {
-        let (surface, us, vs) = crate::native_parametric_mesh::face_knots(g, other)?;
-        (
-            us,
-            vs,
-            Box::new(move |uv: [f64; 2]| surface.evaluate(uv[0], uv[1])),
-        )
+    let cached = index.grids.borrow().get(&other).cloned();
+    let grid = match cached {
+        Some(grid) => grid,
+        None => {
+            let grid = if kind == "CylSurf" {
+                let profile = CylinderTessellationProfile::default();
+                let mesh = cylinder_face(g, other, profile)?;
+                let cylinder = mesh
+                    .analytic_surface
+                    .context("cylinder analytic metadata missing")?;
+                let min: [f64; 2] = std::array::from_fn(|k| {
+                    mesh.trim_uv
+                        .iter()
+                        .map(|p| p[k])
+                        .fold(f64::INFINITY, f64::min)
+                });
+                let max: [f64; 2] = std::array::from_fn(|k| {
+                    mesh.trim_uv
+                        .iter()
+                        .map(|p| p[k])
+                        .fold(f64::NEG_INFINITY, f64::max)
+                });
+                let step = (4.
+                    * (profile.chord_error / (2. * cylinder.radius))
+                        .min(1.)
+                        .sqrt()
+                        .asin())
+                .min(std::f64::consts::FRAC_PI_2);
+                let us =
+                    tessellation_axis(min[0], max[0], step, mesh.trim_uv.iter().map(|p| p[0]))?;
+                let vs = tessellation_axis(
+                    min[1],
+                    max[1],
+                    profile.max_v_edge,
+                    mesh.trim_uv.iter().map(|p| p[1]),
+                )?;
+                let eval: SurfaceEval = std::rc::Rc::new(move |uv: [f64; 2]| {
+                    let (sn, cs) = uv[0].sin_cos();
+                    Ok(std::array::from_fn(|k| {
+                        cylinder.center[k]
+                            + cylinder.radius * (cs * cylinder.x_vec[k] + sn * cylinder.y_vec[k])
+                            + uv[1] * cylinder.z_vec[k]
+                    }))
+                });
+                (us, vs, eval)
+            } else {
+                let (surface, us, vs) = crate::native_parametric_mesh::face_knots(g, other)?;
+                (
+                    us,
+                    vs,
+                    std::rc::Rc::new(move |uv: [f64; 2]| surface.evaluate(uv[0], uv[1]))
+                        as SurfaceEval,
+                )
+            };
+            let grid: NeighbourGrid = std::rc::Rc::new(grid);
+            index.grids.borrow_mut().insert(other, grid.clone());
+            grid
+        }
     };
+    let (u_values, v_values, evaluate) = (&grid.0, &grid.1, &grid.2);
     let ends = edge.fields["m_firstAndLastEdgePnts"]
         .as_array()
         .context("edge endpoints")?;
@@ -384,7 +353,8 @@ fn refined_plane_edge(
     let lo = start[axis].min(end[axis]);
     let hi = start[axis].max(end[axis]);
     let mut values = knots
-        .into_iter()
+        .iter()
+        .copied()
         .filter(|v| *v > lo + 1e-12 && *v < hi - 1e-12)
         .collect::<Vec<_>>();
     values.insert(0, lo);

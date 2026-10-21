@@ -224,6 +224,7 @@ pub mod partition_type_materials;
 pub mod partition_type_parameters;
 pub mod partition_type_records;
 pub mod partitions;
+pub mod progress;
 pub mod project_information;
 pub mod reader;
 pub mod rect_opening_index;
